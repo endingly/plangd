@@ -23,8 +23,7 @@ int main(int argc, char** argv) {
   try {
     bool shutdown_requested = false;
     lsp::ServerEndpoint endpoint(lsp::io::standardIO());
-    plangd::registerLifecycleHandlers(endpoint, plangd::version,
-                                      shutdown_requested);
+    plangd::registerHandlers(endpoint, plangd::version, shutdown_requested);
     endpoint.runMessageLoop();
     return shutdown_requested ? EXIT_SUCCESS : EXIT_FAILURE;
   } catch (const std::exception& error) {

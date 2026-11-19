@@ -4,14 +4,20 @@
 
 #include <lsp/server_endpoint.h>
 
+#include "documents.hpp"
+
 namespace plangd {
 
-void registerLifecycleHandlers(lsp::ServerEndpoint& endpoint,
-                               std::string_view version,
-                               bool& shutdown_requested) {
+void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
+                      bool& shutdown_requested) {
   endpoint.onInitialize([version = std::string(version)](lsp::InitializeParams&&) {
     return lsp::InitializeResult{
-        .capabilities = {},
+        .capabilities =
+            {
+                .positionEncoding = lsp::PositionEncodingKind::UTF16,
+                .textDocumentSync = lsp::TextDocumentSyncOptions{
+                    .openClose = true, .change = lsp::TextDocumentSyncKind::Full},
+            },
         .serverInfo = lsp::ServerInfo{.name = "plangd", .version = version},
     };
   });
@@ -21,6 +27,7 @@ void registerLifecycleHandlers(lsp::ServerEndpoint& endpoint,
     return {};
   });
   endpoint.onExit([] {});
+  registerDocumentHandlers(endpoint);
 }
 
 }  // namespace plangd
