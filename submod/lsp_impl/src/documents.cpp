@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -11,77 +13,166 @@
 #include <vector>
 
 #include <lsp/server_endpoint.h>
+#include <ptx_frontend/binding/ptx_symbol_table.hpp>
 #include <ptx_frontend/cst/ptx_cst_parser.hpp>
+#include <ptx_frontend/syntax/ptx_syntax_lower.hpp>
 
 namespace plangd {
 namespace {
+
+/// Byte span of one line in the document text, excluding its terminator.
+struct SourceLine {
+  std::size_t offset;
+  std::size_t length;
+};
 
 /// A snapshot of the editor buffer at the last accepted document version.
 struct Document {
   std::string text;
   lsp::Int version;
+  std::vector<SourceLine> lines{};
+  // Retain the CST until the first navigation request builds the symbol table.
+  std::optional<ptx_frontend::syntax_cst::CstFile> cst{};
+  std::optional<ptx_frontend::binding::SymbolTable> symbols{};
 };
 
-/// Splits text into line views, treating CRLF as one line break.
-std::vector<std::string_view> splitLines(std::string_view text) {
-  std::vector<std::string_view> lines;
-  auto end = text.find_first_of("\r\n");
+/// Indexes the text by line, treating CRLF as one line break.
+std::vector<SourceLine> indexLines(std::string_view text) {
+  std::vector<SourceLine> lines;
+  std::size_t start = 0;
+  auto end = text.find_first_of("\r\n", start);
   while (end != std::string_view::npos) {
-    lines.push_back(text.substr(0, end));
-    text.remove_prefix(end + (text.substr(end).starts_with("\r\n") ? 2 : 1));
-    end = text.find_first_of("\r\n");
+    lines.push_back({start, end - start});
+    start = end + (text.substr(end).starts_with("\r\n") ? 2 : 1);
+    end = text.find_first_of("\r\n", start);
   }
-  lines.push_back(text);
+  lines.push_back({start, text.size() - start});
   return lines;
 }
 
+/// Borrows the bytes of an indexed line, excluding its line break.
+std::string_view lineText(const Document& document, std::size_t line_index) {
+  const auto& line = document.lines[line_index];
+  return std::string_view(document.text).substr(line.offset, line.length);
+}
+
+/// Counts the UTF-16 units contributed by one byte of UTF-8 text.
+lsp::Uint utf16Width(char value) {
+  const auto byte = static_cast<unsigned char>(value);
+  if ((byte & 0xc0) == 0x80) {
+    return 0;
+  }
+  return byte >= 0xf0 ? 2 : 1;
+}
+
 /// Converts the frontend's one-based byte position into a UTF-16 LSP position.
-lsp::Position toLspPosition(const std::vector<std::string_view>& lines,
+lsp::Position toLspPosition(const Document& document,
                             ptx_frontend::SourcePos source) {
   const auto line_index = std::min(
-      static_cast<std::size_t>(std::max(source.line, 1) - 1), lines.size() - 1);
-  const auto line = lines[line_index];
+      static_cast<std::size_t>(std::max(source.line, 1) - 1),
+      document.lines.size() - 1);
+  const auto line = lineText(document, line_index);
   auto byte_column = std::min(
       static_cast<std::size_t>(std::max(source.column, 1) - 1), line.size());
-  const auto is_continuation = [](unsigned char byte) {
-    return (byte & 0xc0) == 0x80;
-  };
   // A lexer error may land inside a code point. Use its starting boundary.
   while (byte_column != 0 && byte_column < line.size() &&
-         is_continuation(static_cast<unsigned char>(line[byte_column]))) {
+         utf16Width(line[byte_column]) == 0) {
     --byte_column;
   }
 
   lsp::Uint utf16_column = 0;
   for (char value : line.substr(0, byte_column)) {
-    const auto byte = static_cast<unsigned char>(value);
-    if (!is_continuation(byte)) {
-      utf16_column += byte >= 0xf0 ? 2 : 1;
-    }
+    utf16_column += utf16Width(value);
   }
   return {.line = static_cast<lsp::Uint>(line_index), .character = utf16_column};
 }
 
+/// Converts a UTF-16 cursor to a one-based byte position in the same buffer.
+std::optional<ptx_frontend::SourcePos> toSourcePosition(
+    const Document& document, lsp::Position position) {
+  if (position.line >= document.lines.size()) {
+    return std::nullopt;
+  }
+  const auto line = lineText(document, position.line);
+  std::size_t byte_column = 0;
+  lsp::Uint utf16_column = 0;
+  for (char value : line) {
+    const auto width = utf16Width(value);
+    if (utf16_column + width > position.character) {
+      break;
+    }
+    utf16_column += width;
+    ++byte_column;
+  }
+  return ptx_frontend::SourcePos{static_cast<std::int32_t>(position.line) + 1,
+                                 static_cast<std::int32_t>(byte_column) + 1};
+}
+
+/// Converts a frontend range using the current document snapshot.
+lsp::Range toLspRange(const Document& document, ptx_frontend::SourceRange range) {
+  return {.start = toLspPosition(document, range.start),
+          .end = toLspPosition(document, range.end)};
+}
+
 /// Parses the editor snapshot and replaces its diagnostics, even when empty.
 void publishDiagnostics(lsp::ServerEndpoint& endpoint,
-                        const lsp::DocumentUri& uri, const Document& document) {
+                        const lsp::DocumentUri& uri, Document& document) {
+  document.lines = indexLines(document.text);
   auto result = ptx_frontend::PtxCstParser(document.text).parseModule();
+  document.cst = std::move(result.value);
   lsp::PublishDiagnosticsParams params{
       .uri = uri, .diagnostics = {}, .version = document.version};
-  if (!result.diagnostics.empty()) {
-    const auto lines = splitLines(document.text);
-    params.diagnostics.reserve(result.diagnostics.size());
-    for (auto& diagnostic : result.diagnostics) {
-      params.diagnostics.push_back(lsp::Diagnostic{
-          .range = {.start = toLspPosition(lines, diagnostic.range.start),
-                    .end = toLspPosition(lines, diagnostic.range.end)},
-          .message = std::move(diagnostic.message),
-          .severity = lsp::DiagnosticSeverity::Error,
-          .source = "plangd",
-      });
-    }
+  params.diagnostics.reserve(result.diagnostics.size());
+  for (auto& diagnostic : result.diagnostics) {
+    params.diagnostics.push_back(lsp::Diagnostic{
+        .range = toLspRange(document, diagnostic.range),
+        .message = std::move(diagnostic.message),
+        .severity = lsp::DiagnosticSeverity::Error,
+        .source = "plangd",
+    });
   }
   endpoint.textDocumentPublishDiagnostics(params);
+}
+
+/// Resolves a cursor on a register or branch-label reference in this snapshot.
+lsp::TextDocumentDefinitionResult findDefinition(Document& document,
+                                                 const lsp::DocumentUri& uri,
+                                                 lsp::Position position) {
+  const auto source = toSourcePosition(document, position);
+  if (!source) {
+    return nullptr;
+  }
+  if (document.cst) {
+    auto ast = ptx_frontend::lowerSyntaxModule(*document.cst);
+    if (ast) {
+      document.symbols = ptx_frontend::binding::bindSymbols(*ast).table;
+    }
+    document.cst.reset();
+  }
+  if (!document.symbols) {
+    return nullptr;
+  }
+
+  const auto coordinates = [](ptx_frontend::SourcePos point) {
+    return std::pair{point.line, point.column};
+  };
+  const auto cursor = coordinates(*source);
+  const auto& references = document.symbols->references();
+  const auto reference = std::ranges::find_if(references, [&](const auto& ref) {
+    return ref.target && coordinates(ref.range.start) <= cursor &&
+           cursor < coordinates(ref.range.end);
+  });
+  if (reference == references.end()) {
+    return nullptr;
+  }
+  const auto& symbol = document.symbols->symbol(reference->target->symbol);
+  if (symbol.kind != ptx_frontend::binding::SymbolKind::Label &&
+      symbol.state_space != ptx_frontend::base::DeclarationStateSpace::Register) {
+    return nullptr;
+  }
+  return lsp::Definition{
+      lsp::Location{.uri = uri,
+                    .range = toLspRange(document, symbol.declaration_range)}};
 }
 
 }  // namespace
@@ -127,6 +218,16 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint) {
           endpoint.textDocumentPublishDiagnostics(
               {.uri = std::move(uri), .diagnostics = {}});
         }
+      });
+
+  endpoint.onTextDocumentDefinition(
+      [documents](lsp::DefinitionParams&& params)
+          -> lsp::TextDocumentDefinitionResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return findDefinition(entry->second, entry->first, params.position);
       });
 }
 

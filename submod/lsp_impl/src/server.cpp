@@ -17,6 +17,7 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
                 .positionEncoding = lsp::PositionEncodingKind::UTF16,
                 .textDocumentSync = lsp::TextDocumentSyncOptions{
                     .openClose = true, .change = lsp::TextDocumentSyncKind::Full},
+                .definitionProvider = true,
             },
         .serverInfo = lsp::ServerInfo{.name = "plangd", .version = version},
     };
