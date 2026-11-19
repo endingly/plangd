@@ -286,30 +286,44 @@ lsp::TextDocumentHoverResult findHover(Document& document, lsp::Position positio
                    formatCode(describeSymbol(reference->symbol), kind), kind);
 }
 
-/// Completes the mnemonic at the cursor, with documentation where available.
-lsp::TextDocumentCompletionResult completeMnemonic(const Document& document,
-                                                   lsp::Position position) {
+/// Builds a completion item that replaces the requested single-line range.
+lsp::CompletionItem completionItem(std::string_view spelling, lsp::Range range) {
+  return {
+      .label = std::string(spelling),
+      .kind = lsp::CompletionItemKind::Keyword,
+      .textEdit = lsp::TextEdit{.range = range, .newText = std::string(spelling)},
+  };
+}
+
+/// Completes instruction heads against the current document snapshot.
+lsp::TextDocumentCompletionResult completeInstruction(const Document& document,
+                                                      lsp::Position position) {
   const auto source = toSourcePosition(document, position);
   if (!source) {
     return nullptr;
   }
-  const auto context = mnemonicCompletionAt(document.text, *source);
+  const auto line = lineText(document, position.line);
+  const auto context = instructionCompletionAt(document.text, line, *source);
   if (!context) {
     return nullptr;
   }
 
-  const auto range = toLspRange(document, context->range);
-  const auto opcodes = instructionOpcodes();
   lsp::Array<lsp::CompletionItem> items;
-  const std::string_view prefix = context->prefix;
+  if (const auto* modifier = std::get_if<ModifierCompletion>(&*context)) {
+    for (const auto& candidate : modifierCandidates(*modifier, line)) {
+      items.push_back(completionItem(candidate.spelling,
+                                     toLspRange(document, candidate.range)));
+    }
+    return items;
+  }
+
+  const auto& mnemonic = std::get<MnemonicCompletion>(*context);
+  const auto range = toLspRange(document, mnemonic.range);
+  const auto opcodes = instructionOpcodes();
+  const std::string_view prefix = mnemonic.prefix;
   for (auto it = std::ranges::lower_bound(opcodes, prefix);
        it != opcodes.end() && it->starts_with(prefix); ++it) {
-    const auto opcode = std::string(*it);
-    lsp::CompletionItem item{
-        .label = opcode,
-        .kind = lsp::CompletionItemKind::Keyword,
-        .textEdit = lsp::TextEdit{.range = range, .newText = opcode},
-    };
+    auto item = completionItem(*it, range);
     const auto forms = findInstructionDocs(*it);
     if (!forms.empty()) {
       item.documentation = describeInstruction(forms, lsp::MarkupKind::PlainText);
@@ -382,7 +396,7 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
         if (entry == documents->end()) {
           return nullptr;
         }
-        return completeMnemonic(entry->second, params.position);
+        return completeInstruction(entry->second, params.position);
       });
 
   endpoint.onTextDocumentHover(

@@ -3,15 +3,21 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <span>
 #include <tuple>
+#include <utility>
 
 #include <ptx_frontend/lexer/ptx_lexer.hpp>
+
+#include "instruction_modifiers.gen.hpp"
 
 namespace plangd {
 namespace {
 
 using ptx_frontend::PtxToken;
 using ptx_frontend::SourcePos;
+using ptx_frontend::SourceRange;
 using ptx_frontend::TokenKind;
 using ptx_frontend::TriviaKind;
 
@@ -147,10 +153,119 @@ bool inComment(const PtxToken& token, SourcePos cursor) {
   });
 }
 
+/// The lexer gives some modifier spellings their own directive token kind.
+bool isModifierFragment(TokenKind kind) {
+  switch (kind) {
+    case TokenKind::Dot:
+    case TokenKind::DotIdent:
+    case TokenKind::DotGlobal:
+    case TokenKind::DotConst:
+    case TokenKind::DotShared:
+    case TokenKind::DotLocal:
+    case TokenKind::DotParam:
+    case TokenKind::DotWeak:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/// Scans the modifiers after an opcode, leaving the next other token unconsumed.
+std::optional<ModifierCompletion> readModifierCompletion(
+    ptx_frontend::PtxLexer& lexer, std::string_view opcode,
+    std::string_view cursor_line, SourcePos cursor) {
+  std::vector<WrittenModifier> preceding;
+  for (auto token = lexer.peek(); isModifierFragment(token.kind) &&
+       before(token.range.start, cursor); token = lexer.peek()) {
+    lexer.consume();
+    auto range = token.range;
+    if (range.start.line == cursor.line) {
+      auto end = static_cast<std::size_t>(range.end.column - 1);
+      // A partial namespace such as `.param::` has separate colon tokens.
+      while (end < cursor_line.size() && cursor_line[end] == ':') {
+        ++end;
+      }
+      range.end.column = static_cast<std::int32_t>(end + 1);
+      if (!before(range.end, cursor)) {
+        const auto start = static_cast<std::size_t>(range.start.column - 1);
+        const auto length =
+            static_cast<std::size_t>(cursor.column - range.start.column);
+        return ModifierCompletion{
+            std::string(opcode), std::move(preceding),
+            std::string(cursor_line.substr(start, length)), range};
+      }
+    }
+    preceding.push_back({std::move(token.text), token.range});
+  }
+  return std::nullopt;
+}
+
+/// Tries one slot order, skipping only optional slots when a spelling mismatches.
+void collectModifierCandidates(ModifierOrder order,
+                               std::span<const ModifierSlot> slots,
+                               std::span<const WrittenModifier> preceding,
+                               std::string_view prefix, SourceRange range,
+                               std::map<std::string_view, SourceRange>& candidates) {
+  for (const auto id : order) {
+    const auto& slot = slots[id];
+    if (preceding.empty()) {
+      for (const auto spelling : slot.spellings) {
+        if (spelling.starts_with(prefix)) {
+          candidates.try_emplace(spelling, range);
+        }
+      }
+    } else if (std::ranges::contains(slot.spellings, preceding.front().spelling)) {
+      preceding = preceding.subspan(1);
+      continue;
+    }
+    if (!slot.optional) {
+      break;
+    }
+  }
+}
+
+/// Includes any partial compound segments to the right of the cursor in the edit.
+SourceRange compoundEditRange(std::string_view spelling, std::string_view line,
+                              SourceRange range) {
+  auto segment = spelling.find('.', 1);
+  if (segment == std::string_view::npos) {
+    return range;
+  }
+
+  const auto start = static_cast<std::size_t>(range.start.column - 1);
+  auto end = static_cast<std::size_t>(range.end.column - 1);
+  const auto fragment = line.substr(start, end - start);
+  for (auto dot = fragment.find('.', 1);
+       dot != std::string_view::npos && segment != std::string_view::npos;
+       dot = fragment.find('.', dot + 1)) {
+    segment = spelling.find('.', segment + 1);
+  }
+
+  constexpr std::string_view atom =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$%:";
+  while (segment != std::string_view::npos && end < line.size() &&
+         line[end] == '.') {
+    const auto following = line.substr(end);
+    const auto length = following.find_first_not_of(atom, 1);
+    const auto written = following.substr(0, length);
+    const auto separator = spelling.find('.', segment + 1);
+    if (written.size() == 1 ||
+        !spelling.substr(segment, separator == std::string_view::npos
+                                      ? separator : separator - segment)
+             .starts_with(written)) {
+      break;
+    }
+    end += written.size();
+    segment = separator;
+  }
+  range.end.column = static_cast<std::int32_t>(end + 1);
+  return range;
+}
+
 }  // namespace
 
-std::optional<MnemonicCompletion> mnemonicCompletionAt(std::string_view text,
-                                                       SourcePos cursor) {
+std::optional<InstructionCompletion> instructionCompletionAt(
+    std::string_view text, std::string_view cursor_line, SourcePos cursor) {
   ptx_frontend::PtxLexer lexer(text);
   CompletionContext context;
   for (auto token = lexer.consume();; token = lexer.consume()) {
@@ -167,10 +282,16 @@ std::optional<MnemonicCompletion> mnemonicCompletionAt(std::string_view text,
     const bool label = identifier && context.atStatementStart() &&
                        lexer.peek().kind == TokenKind::Colon;
     if (context.expectsOpcode() && identifier && !label &&
-        !token.text.starts_with('%') && !before(token.range.end, cursor)) {
-      const auto length = static_cast<std::size_t>(
-          cursor.column - token.range.start.column);
-      return MnemonicCompletion{token.text.substr(0, length), token.range};
+        !token.text.starts_with('%')) {
+      if (!before(token.range.end, cursor)) {
+        const auto length = static_cast<std::size_t>(
+            cursor.column - token.range.start.column);
+        return MnemonicCompletion{token.text.substr(0, length), token.range};
+      }
+      if (auto modifier =
+              readModifierCompletion(lexer, token.text, cursor_line, cursor)) {
+        return std::move(*modifier);
+      }
     }
     const bool predicate = identifier && context.expectsPredicate();
     const bool unterminated_comment =
@@ -187,6 +308,36 @@ std::optional<MnemonicCompletion> mnemonicCompletionAt(std::string_view text,
     return MnemonicCompletion{{}, {cursor, cursor}};
   }
   return std::nullopt;
+}
+
+std::vector<ModifierCandidate> modifierCandidates(const ModifierCompletion& context,
+                                                  std::string_view cursor_line) {
+  const auto orders = modifierOrders(context.opcode);
+  const auto slots = modifierSlots();
+  std::span<const WrittenModifier> preceding = context.preceding;
+  auto prefix = context.prefix;
+  auto range = context.range;
+  std::map<std::string_view, SourceRange> candidates;
+  for (;;) {
+    for (const auto order : orders) {
+      collectModifierCandidates(order, slots, preceding, prefix, range, candidates);
+    }
+    if (preceding.empty() || preceding.back().range.end != range.start) {
+      break;
+    }
+    // The lexer recognizes compound spellings once complete. Allow partial
+    // ones such as `.xorsign.a` to span adjacent tokens while typing.
+    prefix.insert(0, preceding.back().spelling);
+    range.start = preceding.back().range.start;
+    preceding = preceding.first(preceding.size() - 1);
+  }
+
+  std::vector<ModifierCandidate> result;
+  result.reserve(candidates.size());
+  for (const auto& [spelling, edit_range] : candidates) {
+    result.push_back({spelling, compoundEditRange(spelling, cursor_line, edit_range)});
+  }
+  return result;
 }
 
 }  // namespace plangd

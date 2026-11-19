@@ -306,7 +306,7 @@ def check_symbol_navigation(executable, initialize, shutdown):
     assert "\n```\n\nMove a scalar register" in value, markdown_mov
 
 
-def check_mnemonic_completion(executable, initialize, shutdown):
+def check_instruction_completion(executable, initialize, shutdown):
     """Check completion and source edits on successive unfinished snapshots."""
     uri = "file:///tmp/plangd-completion.ptx"
     header = ".version 8.0\r\n.target sm_90\r\n.address_size 64\r\n"
@@ -330,11 +330,32 @@ def check_mnemonic_completion(executable, initialize, shutdown):
         (body + "  @%p1|", None, None),
         (body + "  @!%p|1 mov.u32 %r1, 0;", None, None),
         (body + "  mo|ve_here: ret;", None, None),
-        (body + "  mov.u|32 %r1, 0;", None, None),
+        (body + "  mov.u|32 %r1, 0;", ".u32", ".u32"),
         (body + "}\r\nmo|", None, None),
         (header + ".global .u32 arr[2] = {mo|};", None, None),
         (header + ".entry mo|() {}", None, None),
+        (body + "  ld.glo|", ".global", ".glo"),
+        (body + "  /* 中文🚀 */ loop: @!%p1 ld.glo|xxx.u32 %r1, [%rd1];", ".global", ".gloxxx"),
+        (body + "  ld.global.|", ".u32", "."),
+        (body + "  ld.global.v2.u| %r1, [%rd1];", ".u32", ".u"),
+        (body + "  ld .global\r\n  .u|", ".u32", ".u"),
+        (body + "  ld.param::|", ".param::entry", ".param::"),
+        (body + "  ld.param::en|try.u32", ".param::entry", ".param::entry"),
+        (body + "  min.xorsign.a|.f32", ".xorsign.abs", ".xorsign.a"),
+        (body + "  min.xor|sign.a.f32", ".xorsign.abs", ".xorsign.a"),
+        (body + "  min.xor|sign.abs.f32", ".xorsign.abs", ".xorsign.abs"),
+        (body + "  fence.cta.acq_|", ".acq_rel", ".acq_"),
+        (body + "  fence.acq_rel.c|", ".cta", ".c"),
+        (body + "  add.f32.f16.sa|", ".sat", ".sa"),
+        (body + "  ld.global.shared.u|", None, ".u"),
+        (body + "  ld.global.unsup|", None, ".unsup"),
+        (body + "  unknown_opcode.glo|", None, ".glo"),
+        (body + "  ld.global.u32 %r1, .glo|", None, None),
+        (body + "  ld /* .glo| */ .global.u32", None, None),
+        (body + "  .reg .u|32 %r1;", None, None),
+        (header + ".target sm_90, .glo|", None, None),
     ]
+    excluded = {body + "  ld.global.|": {".global", ".shared"}}
 
     def column(text):
         return len(text.encode("utf-16-le")) // 2
@@ -369,21 +390,25 @@ def check_mnemonic_completion(executable, initialize, shutdown):
                 "params": {
                     "textDocument": {"uri": uri},
                     "position": {"line": line, "character": cursor},
+                    **({"context": {"triggerKind": 2, "triggerCharacter": "."}}
+                       if left.endswith(".") else {}),
                 },
             },
         ])
         if spelling is None:
-            expected[request_id] = (label, None, "")
+            expected[request_id] = (label, None, "", set())
             continue
+        line_text = line_prefix + right.split("\r\n", 1)[0]
         start = len(line_prefix)
-        while start and (line_prefix[start - 1].isalnum() or line_prefix[start - 1] == "_"):
-            start -= 1
+        if spelling:
+            start = line_text.rfind(spelling, max(0, start - len(spelling)), start + len(spelling))
+            assert start >= 0, marked
         begin = column(line_prefix[:start])
         edit_range = {
             "start": {"line": line, "character": begin},
             "end": {"line": line, "character": begin + column(spelling)},
         }
-        expected[request_id] = (label, edit_range, line_prefix[start:])
+        expected[request_id] = (label, edit_range, line_prefix[start:], excluded.get(marked, set()))
 
     process, responses = exchange(executable, [*messages, *shutdown])
     assert process.returncode == 0, process.stderr
@@ -392,13 +417,14 @@ def check_mnemonic_completion(executable, initialize, shutdown):
         event.get("params", {}).get("version") == 1 and event["params"]["diagnostics"]
         for event in responses if event.get("method") == "textDocument/publishDiagnostics"
     ), responses
-    for request_id, (label, edit_range, prefix) in expected.items():
+    for request_id, (label, edit_range, prefix, forbidden) in expected.items():
         result = results[request_id]["result"]
         if label is None:
             assert result == (None if edit_range is None else []), (request_id, result)
             continue
         labels = [item["label"] for item in result]
         assert label in labels and labels == sorted(set(labels)), (request_id, labels)
+        assert forbidden.isdisjoint(labels), (request_id, labels)
         for item in result:
             assert item["label"].startswith(prefix) and item["kind"] == 14, item
             assert item["textEdit"] == {"range": edit_range, "newText": item["label"]}, item
@@ -430,7 +456,7 @@ if __name__ == "__main__":
     assert capabilities["positionEncoding"] == "utf-16", capabilities
     assert capabilities["definitionProvider"] is True, capabilities
     assert capabilities["hoverProvider"] is True, capabilities
-    assert capabilities["completionProvider"] == {}, capabilities
+    assert capabilities["completionProvider"]["triggerCharacters"] == ["."], capabilities
     assert capabilities["textDocumentSync"] == {
         "openClose": True, "change": 1,
     }, capabilities
@@ -446,4 +472,4 @@ if __name__ == "__main__":
 
     check_document_sync(executable, initialize, shutdown)
     check_symbol_navigation(executable, initialize, shutdown)
-    check_mnemonic_completion(executable, initialize, shutdown)
+    check_instruction_completion(executable, initialize, shutdown)

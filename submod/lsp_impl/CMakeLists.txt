@@ -34,8 +34,11 @@ file(GLOB_RECURSE codegen_inputs CONFIGURE_DEPENDS
 set(generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
 set(instruction_docs_header "${generated_dir}/instruction_docs.gen.hpp")
 set(instruction_docs_source "${generated_dir}/instruction_docs.gen.cpp")
+set(instruction_modifiers_header "${generated_dir}/instruction_modifiers.gen.hpp")
+set(instruction_modifiers_source "${generated_dir}/instruction_modifiers.gen.cpp")
 add_custom_command(
     OUTPUT "${instruction_docs_header}" "${instruction_docs_source}"
+        "${instruction_modifiers_header}" "${instruction_modifiers_source}"
     COMMAND ${codegen_command} --output "${generated_dir}" ${ptx_spec_files}
     DEPENDS "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/python/pyproject.toml"
         ${codegen_inputs} ${ptx_spec_files}
@@ -49,6 +52,8 @@ add_library(plangd_lsp_impl STATIC
     src/server.cpp
     "${instruction_docs_header}"
     "${instruction_docs_source}"
+    "${instruction_modifiers_header}"
+    "${instruction_modifiers_source}"
 )
 target_include_directories(plangd_lsp_impl
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"

@@ -1,10 +1,11 @@
-"""Render the instruction documentation declaration and implementation."""
+"""Render the generated instruction tables used by the language server."""
 
 from pathlib import Path
 
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
 from ..instruction_docs import InstructionData
+from ..instruction_modifiers import InstructionModifiers
 
 
 def cpp_string(text: str) -> str:
@@ -20,8 +21,10 @@ def cpp_string(text: str) -> str:
     return '"' + "".join(escaped) + '"'
 
 
-def emit_instruction_docs(data: InstructionData, output: Path) -> None:
-    """Render both C++ files and reuse existing output when its bytes match."""
+def emit_instruction_data(
+    data: InstructionData, modifiers: InstructionModifiers, output: Path
+) -> None:
+    """Render the C++ tables and reuse existing output when its bytes match."""
     environment = Environment(
         loader=PackageLoader("plangd.code_gen"),
         undefined=StrictUndefined,
@@ -31,8 +34,10 @@ def emit_instruction_docs(data: InstructionData, output: Path) -> None:
     )
     environment.filters["cpp_string"] = cpp_string
     output.mkdir(parents=True, exist_ok=True)
-    for name in ("instruction_docs.gen.hpp", "instruction_docs.gen.cpp"):
-        target = output / name
-        rendered = environment.get_template(f"{name}.j2").render(data=data).encode("utf-8")
-        if not target.is_file() or target.read_bytes() != rendered:
-            target.write_bytes(rendered)
+    for table, table_data in (("instruction_docs", data), ("instruction_modifiers", modifiers)):
+        for extension in ("hpp", "cpp"):
+            name = f"{table}.gen.{extension}"
+            target = output / name
+            rendered = environment.get_template(f"{name}.j2").render(data=table_data).encode("utf-8")
+            if not target.is_file() or target.read_bytes() != rendered:
+                target.write_bytes(rendered)
