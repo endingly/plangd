@@ -16,8 +16,7 @@ void indexInstruction(const cst::CstFile& file,
                       const cst::CstInstruction& instruction,
                       std::vector<InstructionOccurrence>& occurrences) {
   const auto& opcode = file.token(instruction.opcode);
-  const auto forms = std::ranges::equal_range(
-      instructionDocs(), std::string_view(opcode.text), {}, &InstructionDoc::opcode);
+  const auto forms = findInstructionDocs(opcode.text);
   if (forms.empty()) {
     return;
   }
@@ -29,7 +28,7 @@ void indexInstruction(const cst::CstFile& file,
     }
     range.end = modifier_range.end;
   }
-  occurrences.push_back({.range = range, .forms = {forms.begin(), forms.end()}});
+  occurrences.push_back({.range = range, .forms = forms});
 }
 
 /// Visits the parser's source-ordered function body, including nested blocks.
@@ -47,6 +46,12 @@ void indexBody(const cst::CstFile& file,
 }
 
 }  // namespace
+
+std::span<const InstructionDoc> findInstructionDocs(std::string_view opcode) {
+  const auto forms = std::ranges::equal_range(
+      instructionDocs(), opcode, {}, &InstructionDoc::opcode);
+  return {forms.begin(), forms.end()};
+}
 
 std::vector<InstructionOccurrence> indexInstructions(const cst::CstFile& cst) {
   std::vector<InstructionOccurrence> occurrences;

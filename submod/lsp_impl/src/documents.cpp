@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -17,6 +18,7 @@
 #include <ptx_frontend/cst/ptx_cst_parser.hpp>
 #include <ptx_frontend/syntax/ptx_syntax_lower.hpp>
 
+#include "completion.hpp"
 #include "instruction_docs.hpp"
 
 namespace plangd {
@@ -228,7 +230,7 @@ std::string formatCode(std::string_view text, lsp::MarkupKind kind) {
 }
 
 /// Combines documented forms, keeping each syntax next to its description.
-std::string describeInstruction(const InstructionOccurrence& instruction,
+std::string describeInstruction(std::span<const InstructionDoc> forms,
                                 lsp::MarkupKind kind) {
   std::string text;
   const auto append = [&text](std::string_view paragraph) {
@@ -240,7 +242,7 @@ std::string describeInstruction(const InstructionOccurrence& instruction,
     }
     text += paragraph;
   };
-  for (const auto& form : instruction.forms) {
+  for (const auto& form : forms) {
     if (!form.syntax.empty()) {
       append(formatCode(form.syntax, kind));
     }
@@ -274,7 +276,7 @@ lsp::TextDocumentHoverResult findHover(Document& document, lsp::Position positio
   if (instruction != document.instructions.end() &&
       coordinates(instruction->range.start) <= cursor) {
     return makeHover(document, instruction->range,
-                     describeInstruction(*instruction, kind), kind);
+                     describeInstruction(instruction->forms, kind), kind);
   }
   const auto reference = findReference(document, *source);
   if (!reference) {
@@ -282,6 +284,39 @@ lsp::TextDocumentHoverResult findHover(Document& document, lsp::Position positio
   }
   return makeHover(document, reference->range,
                    formatCode(describeSymbol(reference->symbol), kind), kind);
+}
+
+/// Completes the mnemonic at the cursor, with documentation where available.
+lsp::TextDocumentCompletionResult completeMnemonic(const Document& document,
+                                                   lsp::Position position) {
+  const auto source = toSourcePosition(document, position);
+  if (!source) {
+    return nullptr;
+  }
+  const auto context = mnemonicCompletionAt(document.text, *source);
+  if (!context) {
+    return nullptr;
+  }
+
+  const auto range = toLspRange(document, context->range);
+  const auto opcodes = instructionOpcodes();
+  lsp::Array<lsp::CompletionItem> items;
+  const std::string_view prefix = context->prefix;
+  for (auto it = std::ranges::lower_bound(opcodes, prefix);
+       it != opcodes.end() && it->starts_with(prefix); ++it) {
+    const auto opcode = std::string(*it);
+    lsp::CompletionItem item{
+        .label = opcode,
+        .kind = lsp::CompletionItemKind::Keyword,
+        .textEdit = lsp::TextEdit{.range = range, .newText = opcode},
+    };
+    const auto forms = findInstructionDocs(*it);
+    if (!forms.empty()) {
+      item.documentation = describeInstruction(forms, lsp::MarkupKind::PlainText);
+    }
+    items.push_back(std::move(item));
+  }
+  return items;
 }
 
 }  // namespace
@@ -338,6 +373,16 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
           return nullptr;
         }
         return findDefinition(entry->second, entry->first, params.position);
+      });
+
+  endpoint.onTextDocumentCompletion(
+      [documents](lsp::CompletionParams&& params)
+          -> lsp::TextDocumentCompletionResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return completeMnemonic(entry->second, params.position);
       });
 
   endpoint.onTextDocumentHover(

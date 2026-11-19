@@ -306,6 +306,107 @@ def check_symbol_navigation(executable, initialize, shutdown):
     assert "\n```\n\nMove a scalar register" in value, markdown_mov
 
 
+def check_mnemonic_completion(executable, initialize, shutdown):
+    """Check completion and source edits on successive unfinished snapshots."""
+    uri = "file:///tmp/plangd-completion.ptx"
+    header = ".version 8.0\r\n.target sm_90\r\n.address_size 64\r\n"
+    body = header + ".visible .entry example() {\r\n"
+    cases = [
+        (body + "  mo|", "mov", "mo"),
+        (body + "  /* 中文🚀 */ loop: @!%p1 mo|xxx.u32 %r1, 0;", "mov", "moxxx"),
+        (body + "  { ret; } ad|", "add", "ad"),
+        (body + "  .loc 1 2 3\r\n  re|", "ret", "re"),
+        (body + "  ret; |}", "add", ""),
+        (body + "  ret; re|}", "ret", "re"),
+        (header + '.entry example() .pragma "nounroll"; {mo|}', "mov", "mo"),
+        (body + "  ret; no_such_opcode|", None, "no_such_opcode"),
+        (body + "  mov.u32 %r1,\r\n  mo|", None, None),
+        (body + "  mov.u32 %r1, mo|;", None, None),
+        (body + "  mov.u32 {%r1, mo|}, %r2;", None, None),
+        (body + "  // ret; mo|", None, None),
+        (body + "  /* 中文🚀\r\n  mo| */", None, None),
+        (body + "  /* unterminated mo|", None, None),
+        (body + '  .pragma "ret; mo|";', None, None),
+        (body + "  @%p1|", None, None),
+        (body + "  @!%p|1 mov.u32 %r1, 0;", None, None),
+        (body + "  mo|ve_here: ret;", None, None),
+        (body + "  mov.u|32 %r1, 0;", None, None),
+        (body + "}\r\nmo|", None, None),
+        (header + ".global .u32 arr[2] = {mo|};", None, None),
+        (header + ".entry mo|() {}", None, None),
+    ]
+
+    def column(text):
+        return len(text.encode("utf-16-le")) // 2
+
+    messages = [
+        *initialize,
+        {
+            "method": "textDocument/didOpen",
+            "params": {"textDocument": {
+                "uri": uri, "languageId": "ptx", "version": 0, "text": header,
+            }},
+        },
+    ]
+    expected = {}
+    for index, (marked, label, spelling) in enumerate(cases, start=1):
+        left, right = marked.split("|")
+        line = left.count("\n")
+        line_prefix = left.rsplit("\n", 1)[-1]
+        cursor = column(line_prefix)
+        request_id = index + 100
+        messages.extend([
+            {
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": uri, "version": index},
+                    "contentChanges": [{"text": left + right}],
+                },
+            },
+            {
+                "method": "textDocument/completion",
+                "id": request_id,
+                "params": {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": line, "character": cursor},
+                },
+            },
+        ])
+        if spelling is None:
+            expected[request_id] = (label, None, "")
+            continue
+        start = len(line_prefix)
+        while start and (line_prefix[start - 1].isalnum() or line_prefix[start - 1] == "_"):
+            start -= 1
+        begin = column(line_prefix[:start])
+        edit_range = {
+            "start": {"line": line, "character": begin},
+            "end": {"line": line, "character": begin + column(spelling)},
+        }
+        expected[request_id] = (label, edit_range, line_prefix[start:])
+
+    process, responses = exchange(executable, [*messages, *shutdown])
+    assert process.returncode == 0, process.stderr
+    results = {response["id"]: response for response in responses if "id" in response}
+    assert any(
+        event.get("params", {}).get("version") == 1 and event["params"]["diagnostics"]
+        for event in responses if event.get("method") == "textDocument/publishDiagnostics"
+    ), responses
+    for request_id, (label, edit_range, prefix) in expected.items():
+        result = results[request_id]["result"]
+        if label is None:
+            assert result == (None if edit_range is None else []), (request_id, result)
+            continue
+        labels = [item["label"] for item in result]
+        assert label in labels and labels == sorted(set(labels)), (request_id, labels)
+        for item in result:
+            assert item["label"].startswith(prefix) and item["kind"] == 14, item
+            assert item["textEdit"] == {"range": edit_range, "newText": item["label"]}, item
+        if label == "mov":
+            move = next(item for item in result if item["label"] == label)
+            assert "Move a scalar register" in move["documentation"], move
+
+
 if __name__ == "__main__":
     executable, version = sys.argv[1:]
     version_result = subprocess.run(
@@ -329,6 +430,7 @@ if __name__ == "__main__":
     assert capabilities["positionEncoding"] == "utf-16", capabilities
     assert capabilities["definitionProvider"] is True, capabilities
     assert capabilities["hoverProvider"] is True, capabilities
+    assert capabilities["completionProvider"] == {}, capabilities
     assert capabilities["textDocumentSync"] == {
         "openClose": True, "change": 1,
     }, capabilities
@@ -344,3 +446,4 @@ if __name__ == "__main__":
 
     check_document_sync(executable, initialize, shutdown)
     check_symbol_navigation(executable, initialize, shutdown)
+    check_mnemonic_completion(executable, initialize, shutdown)

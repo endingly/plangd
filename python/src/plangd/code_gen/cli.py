@@ -7,11 +7,11 @@ from pathlib import Path
 from ptx_frontend.spec.resources import packaged_spec_dir
 
 from .emit.instruction_docs import emit_instruction_docs
-from .instruction_docs import load_instruction_docs
+from .instruction_docs import load_instruction_data
 
 
 def main() -> int:
-    """Read the requested PTX YAML files and emit the C++ documentation table."""
+    """Read PTX YAML files and emit the C++ instruction names and docs."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True, help="generated C++ directory")
     parser.add_argument(
@@ -20,9 +20,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.spec_files:
-        docs = load_instruction_docs(args.spec_files)
+        data = load_instruction_data(args.spec_files)
     else:
         with as_file(packaged_spec_dir()) as spec_dir:
-            docs = load_instruction_docs(spec_dir.rglob("*.yaml"))
-    emit_instruction_docs(docs, args.output)
+            data = load_instruction_data(spec_dir.rglob("*.yaml"))
+    emit_instruction_docs(data, args.output)
     return 0

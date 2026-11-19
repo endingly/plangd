@@ -19,6 +19,9 @@ struct InstructionOccurrence {
   std::span<const InstructionDoc> forms;
 };
 
+/// Finds the authored forms for an exact opcode, if it has documentation.
+std::span<const InstructionDoc> findInstructionDocs(std::string_view opcode);
+
 /// Indexes documented instruction mnemonics in lexical source order.
 std::vector<InstructionOccurrence> indexInstructions(
     const ptx_frontend::syntax_cst::CstFile& cst);

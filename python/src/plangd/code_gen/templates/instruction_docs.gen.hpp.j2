@@ -16,4 +16,7 @@ struct InstructionDoc {
 /// Borrows the embedded opcode-sorted table for the lifetime of the process.
 std::span<const InstructionDoc> instructionDocs() noexcept;
 
+/// Borrows all distinct opcode spellings, sorted lexicographically.
+std::span<const std::string_view> instructionOpcodes() noexcept;
+
 }  // namespace plangd

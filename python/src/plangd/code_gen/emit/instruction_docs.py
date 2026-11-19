@@ -4,7 +4,7 @@ from pathlib import Path
 
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
-from ..instruction_docs import InstructionDoc
+from ..instruction_docs import InstructionData
 
 
 def cpp_string(text: str) -> str:
@@ -20,7 +20,7 @@ def cpp_string(text: str) -> str:
     return '"' + "".join(escaped) + '"'
 
 
-def emit_instruction_docs(docs: tuple[InstructionDoc, ...], output: Path) -> None:
+def emit_instruction_docs(data: InstructionData, output: Path) -> None:
     """Render both C++ files and reuse existing output when its bytes match."""
     environment = Environment(
         loader=PackageLoader("plangd.code_gen"),
@@ -33,6 +33,6 @@ def emit_instruction_docs(docs: tuple[InstructionDoc, ...], output: Path) -> Non
     output.mkdir(parents=True, exist_ok=True)
     for name in ("instruction_docs.gen.hpp", "instruction_docs.gen.cpp"):
         target = output / name
-        rendered = environment.get_template(f"{name}.j2").render(docs=docs).encode("utf-8")
+        rendered = environment.get_template(f"{name}.j2").render(data=data).encode("utf-8")
         if not target.is_file() or target.read_bytes() != rendered:
             target.write_bytes(rendered)

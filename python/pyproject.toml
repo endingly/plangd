@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "plangd-codegen"
 version = "0.0.1"
-description = "Generate C++ instruction documentation for plangd"
+description = "Generate C++ instruction data for plangd"
 requires-python = ">=3.14"
 dependencies = [
     "ptx_frontend @ https://github.com/endingly/ptx_frontend/releases/download/v0.8.0/ptx_frontend-0.8.0-py3-none-any.whl#sha256=9306243b6d66d172f050c898338fba186567b6bf86d1a428e778e4c1b16a5e68",

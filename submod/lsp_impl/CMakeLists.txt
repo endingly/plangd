@@ -1,5 +1,5 @@
 find_package(lsp 2.0 CONFIG REQUIRED)
-find_package(ptx_frontend CONFIG REQUIRED COMPONENTS cst syntax binding ptx_spec)
+find_package(ptx_frontend CONFIG REQUIRED COMPONENTS lexer cst syntax binding ptx_spec)
 
 set(codegen_source_dir "${PROJECT_SOURCE_DIR}/python/src")
 set(codegen_command
@@ -43,6 +43,7 @@ add_custom_command(
 )
 
 add_library(plangd_lsp_impl STATIC
+    src/completion.cpp
     src/documents.cpp
     src/instruction_docs.cpp
     src/server.cpp
@@ -55,5 +56,5 @@ target_include_directories(plangd_lsp_impl
 )
 target_link_libraries(plangd_lsp_impl
     PUBLIC lsp::lsp
-    PRIVATE ptx_frontend::cst ptx_frontend::syntax ptx_frontend::binding
+    PRIVATE ptx_frontend::lexer ptx_frontend::cst ptx_frontend::syntax ptx_frontend::binding
 )

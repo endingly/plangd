@@ -1,4 +1,4 @@
-"""Extract the authored instruction documentation from PTX specification YAML."""
+"""Extract instruction names and documentation from PTX specification YAML."""
 
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -16,8 +16,17 @@ class InstructionDoc:
     description: str
 
 
-def load_instruction_docs(spec_files: Iterable[Path]) -> tuple[InstructionDoc, ...]:
-    """Read and deduplicate documented instruction forms in stable order."""
+@dataclass(frozen=True)
+class InstructionData:
+    """All opcodes and their documented forms, each sorted for lookup."""
+
+    opcodes: tuple[str, ...]
+    docs: tuple[InstructionDoc, ...]
+
+
+def load_instruction_data(spec_files: Iterable[Path]) -> InstructionData:
+    """Read and deduplicate opcodes and documented forms in stable order."""
+    opcodes = set()
     forms = set()
     for path in spec_files:
         if path.name.endswith(".schema.yaml"):
@@ -26,10 +35,12 @@ def load_instruction_docs(spec_files: Iterable[Path]) -> tuple[InstructionDoc, .
         if not isinstance(instructions, list):
             raise ValueError(f"{path}: expected an instructions sequence")
         for entry in instructions:
+            opcode = entry["opcode"]
+            opcodes.add(opcode)
             syntax = entry.get("syntax", "").strip(" \t\r\n")
             description = entry.get("doc", "").strip(" \t\r\n")
             if syntax or description:
-                forms.add(InstructionDoc(entry["opcode"], syntax, description))
-    if not forms:
-        raise ValueError("PTX specs contain no documented instructions")
-    return tuple(sorted(forms))
+                forms.add(InstructionDoc(opcode, syntax, description))
+    if not opcodes:
+        raise ValueError("PTX specs contain no instructions")
+    return InstructionData(tuple(sorted(opcodes)), tuple(sorted(forms)))
