@@ -36,6 +36,12 @@ struct Document {
   std::optional<ptx_frontend::binding::SymbolTable> symbols{};
 };
 
+/// A bound symbol and the range of the reference under the cursor.
+struct ResolvedReference {
+  const ptx_frontend::binding::Symbol& symbol;
+  ptx_frontend::SourceRange range;
+};
+
 /// Indexes the text by line, treating CRLF as one line break.
 std::vector<SourceLine> indexLines(std::string_view text) {
   std::vector<SourceLine> lines;
@@ -135,12 +141,11 @@ void publishDiagnostics(lsp::ServerEndpoint& endpoint,
 }
 
 /// Resolves a cursor on a register or branch-label reference in this snapshot.
-lsp::TextDocumentDefinitionResult findDefinition(Document& document,
-                                                 const lsp::DocumentUri& uri,
-                                                 lsp::Position position) {
+std::optional<ResolvedReference> findReference(Document& document,
+                                               lsp::Position position) {
   const auto source = toSourcePosition(document, position);
   if (!source) {
-    return nullptr;
+    return std::nullopt;
   }
   if (document.cst) {
     auto ast = ptx_frontend::lowerSyntaxModule(*document.cst);
@@ -150,7 +155,7 @@ lsp::TextDocumentDefinitionResult findDefinition(Document& document,
     document.cst.reset();
   }
   if (!document.symbols) {
-    return nullptr;
+    return std::nullopt;
   }
 
   const auto coordinates = [](ptx_frontend::SourcePos point) {
@@ -163,21 +168,71 @@ lsp::TextDocumentDefinitionResult findDefinition(Document& document,
            cursor < coordinates(ref.range.end);
   });
   if (reference == references.end()) {
-    return nullptr;
+    return std::nullopt;
   }
   const auto& symbol = document.symbols->symbol(reference->target->symbol);
   if (symbol.kind != ptx_frontend::binding::SymbolKind::Label &&
       symbol.state_space != ptx_frontend::base::DeclarationStateSpace::Register) {
+    return std::nullopt;
+  }
+  return ResolvedReference{symbol, reference->range};
+}
+
+/// Returns the declaration location of the reference under the cursor.
+lsp::TextDocumentDefinitionResult findDefinition(Document& document,
+                                                 const lsp::DocumentUri& uri,
+                                                 lsp::Position position) {
+  const auto reference = findReference(document, position);
+  if (!reference) {
     return nullptr;
   }
-  return lsp::Definition{
-      lsp::Location{.uri = uri,
-                    .range = toLspRange(document, symbol.declaration_range)}};
+  return lsp::Definition{lsp::Location{
+      .uri = uri,
+      .range = toLspRange(document, reference->symbol.declaration_range)}};
+}
+
+/// Formats the bound label or register declaration for display.
+std::string describeSymbol(const ptx_frontend::binding::Symbol& symbol) {
+  if (symbol.kind == ptx_frontend::binding::SymbolKind::Label) {
+    return symbol.name + ':';
+  }
+  std::string declaration = ".reg ";
+  if (symbol.vector_width) {
+    declaration += ".v" + std::to_string(*symbol.vector_width) + ' ';
+  }
+  if (symbol.type) {
+    declaration += *symbol.type + ' ';
+  }
+  declaration += symbol.name;
+  if (symbol.parameterized_count) {
+    declaration += '<' + std::to_string(*symbol.parameterized_count) + '>';
+  }
+  declaration += ';';
+  return declaration;
+}
+
+/// Shows the declaration of a reference and highlights its spelling at the cursor.
+lsp::TextDocumentHoverResult findHover(Document& document, lsp::Position position,
+                                      lsp::MarkupKind kind) {
+  const auto reference = findReference(document, position);
+  if (!reference) {
+    return nullptr;
+  }
+  auto declaration = describeSymbol(reference->symbol);
+  if (kind == lsp::MarkupKind::Markdown) {
+    declaration = "```ptx\n" + declaration + "\n```";
+  }
+  return lsp::Hover{
+      .contents =
+          lsp::MarkupContent{.kind = kind, .value = std::move(declaration)},
+      .range = toLspRange(document, reference->range),
+  };
 }
 
 }  // namespace
 
-void registerDocumentHandlers(lsp::ServerEndpoint& endpoint) {
+void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
+                              std::shared_ptr<const lsp::MarkupKind> hover_kind) {
   using Documents = std::unordered_map<lsp::DocumentUri, Document>;
   auto documents = std::make_shared<Documents>();
   endpoint.onTextDocumentDidOpen(
@@ -228,6 +283,16 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint) {
           return nullptr;
         }
         return findDefinition(entry->second, entry->first, params.position);
+      });
+
+  endpoint.onTextDocumentHover(
+      [documents, hover_kind = std::move(hover_kind)](lsp::HoverParams&& params)
+          -> lsp::TextDocumentHoverResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return findHover(entry->second, params.position, *hover_kind);
       });
 }
 

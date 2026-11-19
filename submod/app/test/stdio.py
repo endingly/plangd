@@ -106,8 +106,8 @@ def check_document_sync(executable, initialize, shutdown):
     assert closed["diagnostics"] == [], closed
 
 
-def check_definition(executable, initialize, shutdown):
-    """Check lexical scopes, UTF-16 ranges and navigation after buffer edits."""
+def check_symbol_navigation(executable, initialize, shutdown):
+    """Check definition and hover across scopes and unsaved document versions."""
     uri = "file:///tmp/plangd-definition.ptx"
     comment = "/* 中文🚀 */"
     lines = [
@@ -122,11 +122,13 @@ def check_definition(executable, initialize, shutdown):
         "  ret;",
         "}",
         ".visible .entry second() {",
-        f"  {comment} .reg .u32 %r1;",
-        f"  {comment} mov.u32 %r1, 2;",
+        f"  {comment} .reg .s32 %r1;",
+        f"  {comment} mov.s32 %r1, 2;",
         "  bra done;",
         "  mov.u32 %missing, 2;",
         "done:",
+        "  .reg .u32 %tmp<4>;",
+        "  mov.u32 %tmp1, 0;",
         "  ret;",
         "}",
     ]
@@ -136,57 +138,77 @@ def check_definition(executable, initialize, shutdown):
         column = len(prefix.encode("utf-16-le")) // 2
         return {"line": line + shift, "character": column}
 
-    def definition(request_id, cursor):
+    def request(request_id, cursor, method="definition"):
         return {
             "id": request_id,
-            "method": "textDocument/definition",
+            "method": f"textDocument/{method}",
             "params": {"textDocument": {"uri": uri}, "position": cursor},
         }
 
-    def location(line, symbol, shift=0):
+    def symbol_range(line, symbol, shift=0):
         start = position(line, symbol, shift)
         end = {**start, "character": start["character"] + len(symbol)}
-        return {"uri": uri, "range": {"start": start, "end": end}}
+        return {"start": start, "end": end}
+
+    def location(line, symbol, shift=0):
+        return {"uri": uri, "range": symbol_range(line, symbol, shift)}
+
+    def hover(line, symbol, declaration, shift=0, kind="plaintext"):
+        return {
+            "contents": {"kind": kind, "value": declaration},
+            "range": symbol_range(line, symbol, shift),
+        }
 
     text = "\r\n".join(lines)
+    open_document = {
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ptx",
+                "version": 1,
+                "text": text,
+            },
+        },
+    }
+    edited_text = text.replace(".reg .s32 %r1;", ".reg .b32 %r1;")
     process, responses = exchange(
         executable,
         [
             *initialize,
-            definition(10, position(5, "%r1")),  # The buffer is not open yet.
-            {
-                "method": "textDocument/didOpen",
-                "params": {
-                    "textDocument": {
-                        "uri": uri,
-                        "languageId": "ptx",
-                        "version": 1,
-                        "text": text,
-                    },
-                },
-            },
-            definition(11, position(5, "%r1")),
-            definition(12, position(12, "%r1")),
-            definition(13, position(6, "done")),
-            definition(14, position(13, "done")),
-            definition(15, position(14, "%missing")),
-            definition(16, position(5, ",")),  # The end of a reference is exclusive.
+            request(10, position(5, "%r1")),  # The buffer is not open yet.
+            request(20, position(5, "%r1"), "hover"),
+            open_document,
+            request(11, position(5, "%r1")),
+            request(12, position(12, "%r1")),
+            request(13, position(6, "done")),
+            request(14, position(13, "done")),
+            request(15, position(14, "%missing")),
+            request(16, position(5, ",")),  # The end of a reference is exclusive.
+            request(21, position(5, "%r1"), "hover"),
+            request(22, position(12, "%r1"), "hover"),
+            request(23, position(13, "done"), "hover"),
+            request(24, position(14, "%missing"), "hover"),
+            request(25, position(5, ","), "hover"),
+            request(26, position(17, "%tmp1"), "hover"),
             {
                 "method": "textDocument/didChange",
                 "params": {
                     "textDocument": {"uri": uri, "version": 2},
                     "contentChanges": [
-                        {"text": "// unsaved edit\r\n" + text + "\r\n.global .u32 ;"}
+                        {"text": "// unsaved edit\r\n" + edited_text + "\r\n.global .u32 ;"}
                     ],
                 },
             },
-            definition(17, position(12, "%r1", shift=1)),
-            definition(18, position(13, "done", shift=1)),
+            request(27, position(12, "%r1", shift=1), "hover"),
+            request(17, position(12, "%r1", shift=1)),
+            request(18, position(13, "done", shift=1)),
             {
                 "method": "textDocument/didClose",
                 "params": {"textDocument": {"uri": uri}},
             },
-            definition(19, position(13, "done", shift=1)),
+            request(19, position(13, "done", shift=1)),
+            request(28, position(13, "done", shift=1), "hover"),
             *shutdown,
         ],
     )
@@ -210,9 +232,43 @@ def check_definition(executable, initialize, shutdown):
         17: location(11, "%r1", shift=1),
         18: location(15, "done", shift=1),
         19: None,
+        20: None,
+        21: hover(5, "%r1", ".reg .u32 %r1;"),
+        22: hover(12, "%r1", ".reg .s32 %r1;"),
+        23: hover(13, "done", "done:"),
+        24: None,
+        25: None,
+        26: hover(17, "%tmp1", ".reg .u32 %tmp<4>;"),
+        27: hover(12, "%r1", ".reg .b32 %r1;", shift=1),
+        28: None,
     }
     for request_id, result in expected.items():
         assert results[request_id].get("result", ...) == result, results[request_id]
+
+    markdown_initialize = {
+        **initialize[0],
+        "params": {
+            **initialize[0]["params"],
+            "capabilities": {
+                "textDocument": {"hover": {"contentFormat": ["markdown", "plaintext"]}},
+            },
+        },
+    }
+    process, responses = exchange(
+        executable,
+        [
+            markdown_initialize,
+            *initialize[1:],
+            open_document,
+            request(30, position(12, "%r1"), "hover"),
+            *shutdown,
+        ],
+    )
+    assert process.returncode == 0, process.stderr
+    markdown = next(response for response in responses if response.get("id") == 30)
+    assert markdown.get("result") == hover(
+        12, "%r1", "```ptx\n.reg .s32 %r1;\n```", kind="markdown"
+    ), markdown
 
 
 if __name__ == "__main__":
@@ -237,6 +293,7 @@ if __name__ == "__main__":
     capabilities = responses[0]["result"]["capabilities"]
     assert capabilities["positionEncoding"] == "utf-16", capabilities
     assert capabilities["definitionProvider"] is True, capabilities
+    assert capabilities["hoverProvider"] is True, capabilities
     assert capabilities["textDocumentSync"] == {
         "openClose": True, "change": 1,
     }, capabilities
@@ -251,4 +308,4 @@ if __name__ == "__main__":
     assert responses == [], responses
 
     check_document_sync(executable, initialize, shutdown)
-    check_definition(executable, initialize, shutdown)
+    check_symbol_navigation(executable, initialize, shutdown)
