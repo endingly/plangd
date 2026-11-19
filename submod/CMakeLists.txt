@@ -1,3 +1,2 @@
-include(register_headers)
-
-add_subdirectory(common)
+add_subdirectory(lsp_impl)
+add_subdirectory(app)

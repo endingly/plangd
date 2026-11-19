@@ -4,7 +4,7 @@
 
 namespace plangd {
 
-/// Version of the plangd package used at compile time.
+/// Version reported by the executable and the LSP initialization response.
 inline constexpr std::string_view version = "@PROJECT_VERSION@";
 
 }  // namespace plangd

@@ -30,20 +30,10 @@ include(CTest)
 
 add_subdirectory(submod)
 
-add_library(plangd INTERFACE)
-add_library(plangd::plangd ALIAS plangd)
-target_link_libraries(plangd INTERFACE plangd::common)
-
 include(install_project_targets)
 install_project_targets(
     PROJECT "${PROJECT_NAME}"
     VERSION "${PROJECT_VERSION}"
-    TARGETS plangd plangd_common
-    COMPONENTS plangd common
-    INCLUDE_DIRS
-        "${CMAKE_CURRENT_SOURCE_DIR}/submod/common/include"
-        "${CMAKE_CURRENT_BINARY_DIR}/submod/common/include"
-    INCLUDE_DESTINATIONS
-        "${CMAKE_INSTALL_INCLUDEDIR}/plangd/common"
-        "${CMAKE_INSTALL_INCLUDEDIR}/plangd/common"
+    TARGETS plangd
+    COMPONENTS plangd
 )

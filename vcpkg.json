@@ -6,7 +6,9 @@
   "dependencies": [
     "fmt",
     "gtest",
-    "magic-enum"
+    "lsp-framework",
+    "magic-enum",
+    "ptx-frontend"
   ],
   "features": {
     "benchmarks": {
