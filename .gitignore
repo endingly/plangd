@@ -1,9 +1,12 @@
 .cache/
+.venv/
 .vscode/
 .vcpkg/
 build/
 out/
 vcpkg_installed/
+__pycache__/
+*.egg-info/
 CMakeUserPresets.json
 .codex/
 .aws/

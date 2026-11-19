@@ -8,8 +8,7 @@
     "gtest",
     "lsp-framework",
     "magic-enum",
-    "ptx-frontend",
-    "yaml-cpp"
+    "ptx-frontend"
   ],
   "features": {
     "benchmarks": {

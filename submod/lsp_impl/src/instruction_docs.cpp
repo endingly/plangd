@@ -9,8 +9,6 @@
 namespace plangd {
 namespace {
 
-#include "instruction_docs.inc"
-
 namespace cst = ptx_frontend::syntax_cst;
 
 /// Adds the opcode and its adjacent modifier tokens from one instruction.
@@ -19,7 +17,7 @@ void indexInstruction(const cst::CstFile& file,
                       std::vector<InstructionOccurrence>& occurrences) {
   const auto& opcode = file.token(instruction.opcode);
   const auto forms = std::ranges::equal_range(
-      kInstructionDocs, std::string_view(opcode.text), {}, &InstructionDoc::opcode);
+      instructionDocs(), std::string_view(opcode.text), {}, &InstructionDoc::opcode);
   if (forms.empty()) {
     return;
   }

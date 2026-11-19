@@ -6,7 +6,6 @@ target_include_directories(plangd PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated
 target_link_libraries(plangd PRIVATE plangd_lsp_impl)
 
 if(BUILD_TESTING)
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME plangd.stdio
         COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/test/stdio.py"
             $<TARGET_FILE:plangd> "${PROJECT_VERSION}"

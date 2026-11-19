@@ -1,23 +1,17 @@
 #pragma once
 
 #include <span>
-#include <string_view>
 #include <vector>
 
 #include <ptx_frontend/common/source_loc.hpp>
+
+#include "instruction_docs.gen.hpp"
 
 namespace ptx_frontend::syntax_cst {
 struct CstFile;
 }
 
 namespace plangd {
-
-/// One documented form of an opcode, stored in the embedded spec index.
-struct InstructionDoc {
-  std::string_view opcode;
-  std::string_view syntax;
-  std::string_view description;
-};
 
 /// The mnemonic range and its documented forms, independent of CST lifetime.
 struct InstructionOccurrence {
