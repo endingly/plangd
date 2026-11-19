@@ -17,6 +17,8 @@
 #include <ptx_frontend/cst/ptx_cst_parser.hpp>
 #include <ptx_frontend/syntax/ptx_syntax_lower.hpp>
 
+#include "instruction_docs.hpp"
+
 namespace plangd {
 namespace {
 
@@ -31,6 +33,7 @@ struct Document {
   std::string text;
   lsp::Int version;
   std::vector<SourceLine> lines{};
+  std::vector<InstructionOccurrence> instructions{};
   // Retain the CST until the first navigation request builds the symbol table.
   std::optional<ptx_frontend::syntax_cst::CstFile> cst{};
   std::optional<ptx_frontend::binding::SymbolTable> symbols{};
@@ -125,6 +128,9 @@ void publishDiagnostics(lsp::ServerEndpoint& endpoint,
                         const lsp::DocumentUri& uri, Document& document) {
   document.lines = indexLines(document.text);
   auto result = ptx_frontend::PtxCstParser(document.text).parseModule();
+  if (result) {
+    document.instructions = indexInstructions(*result);
+  }
   document.cst = std::move(result.value);
   lsp::PublishDiagnosticsParams params{
       .uri = uri, .diagnostics = {}, .version = document.version};
@@ -140,13 +146,14 @@ void publishDiagnostics(lsp::ServerEndpoint& endpoint,
   endpoint.textDocumentPublishDiagnostics(params);
 }
 
+/// Orders frontend positions by line and byte column.
+auto coordinates(ptx_frontend::SourcePos point) {
+  return std::pair{point.line, point.column};
+}
+
 /// Resolves a cursor on a register or branch-label reference in this snapshot.
 std::optional<ResolvedReference> findReference(Document& document,
-                                               lsp::Position position) {
-  const auto source = toSourcePosition(document, position);
-  if (!source) {
-    return std::nullopt;
-  }
+                                               ptx_frontend::SourcePos source) {
   if (document.cst) {
     auto ast = ptx_frontend::lowerSyntaxModule(*document.cst);
     if (ast) {
@@ -158,10 +165,7 @@ std::optional<ResolvedReference> findReference(Document& document,
     return std::nullopt;
   }
 
-  const auto coordinates = [](ptx_frontend::SourcePos point) {
-    return std::pair{point.line, point.column};
-  };
-  const auto cursor = coordinates(*source);
+  const auto cursor = coordinates(source);
   const auto& references = document.symbols->references();
   const auto reference = std::ranges::find_if(references, [&](const auto& ref) {
     return ref.target && coordinates(ref.range.start) <= cursor &&
@@ -182,7 +186,11 @@ std::optional<ResolvedReference> findReference(Document& document,
 lsp::TextDocumentDefinitionResult findDefinition(Document& document,
                                                  const lsp::DocumentUri& uri,
                                                  lsp::Position position) {
-  const auto reference = findReference(document, position);
+  const auto source = toSourcePosition(document, position);
+  if (!source) {
+    return nullptr;
+  }
+  const auto reference = findReference(document, *source);
   if (!reference) {
     return nullptr;
   }
@@ -211,22 +219,69 @@ std::string describeSymbol(const ptx_frontend::binding::Symbol& symbol) {
   return declaration;
 }
 
-/// Shows the declaration of a reference and highlights its spelling at the cursor.
+/// Uses PTX code fences when the client requested Markdown hover content.
+std::string formatCode(std::string_view text, lsp::MarkupKind kind) {
+  if (kind == lsp::MarkupKind::Markdown) {
+    return "```ptx\n" + std::string(text) + "\n```";
+  }
+  return std::string(text);
+}
+
+/// Combines documented forms, keeping each syntax next to its description.
+std::string describeInstruction(const InstructionOccurrence& instruction,
+                                lsp::MarkupKind kind) {
+  std::string text;
+  const auto append = [&text](std::string_view paragraph) {
+    if (paragraph.empty()) {
+      return;
+    }
+    if (!text.empty()) {
+      text += "\n\n";
+    }
+    text += paragraph;
+  };
+  for (const auto& form : instruction.forms) {
+    if (!form.syntax.empty()) {
+      append(formatCode(form.syntax, kind));
+    }
+    append(form.description);
+  }
+  return text;
+}
+
+/// Builds a hover response whose highlight matches the symbol or mnemonic.
+lsp::Hover makeHover(const Document& document, ptx_frontend::SourceRange range,
+                     std::string text, lsp::MarkupKind kind) {
+  return lsp::Hover{
+      .contents = lsp::MarkupContent{.kind = kind, .value = std::move(text)},
+      .range = toLspRange(document, range),
+  };
+}
+
+/// Looks up mnemonics first, then bound references in the editor snapshot.
 lsp::TextDocumentHoverResult findHover(Document& document, lsp::Position position,
                                       lsp::MarkupKind kind) {
-  const auto reference = findReference(document, position);
+  const auto source = toSourcePosition(document, position);
+  if (!source) {
+    return nullptr;
+  }
+
+  const auto cursor = coordinates(*source);
+  const auto instruction = std::ranges::upper_bound(
+      document.instructions, cursor, {}, [](const InstructionOccurrence& entry) {
+        return coordinates(entry.range.end);
+      });
+  if (instruction != document.instructions.end() &&
+      coordinates(instruction->range.start) <= cursor) {
+    return makeHover(document, instruction->range,
+                     describeInstruction(*instruction, kind), kind);
+  }
+  const auto reference = findReference(document, *source);
   if (!reference) {
     return nullptr;
   }
-  auto declaration = describeSymbol(reference->symbol);
-  if (kind == lsp::MarkupKind::Markdown) {
-    declaration = "```ptx\n" + declaration + "\n```";
-  }
-  return lsp::Hover{
-      .contents =
-          lsp::MarkupContent{.kind = kind, .value = std::move(declaration)},
-      .range = toLspRange(document, reference->range),
-  };
+  return makeHover(document, reference->range,
+                   formatCode(describeSymbol(reference->symbol), kind), kind);
 }
 
 }  // namespace

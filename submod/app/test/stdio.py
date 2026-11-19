@@ -107,9 +107,9 @@ def check_document_sync(executable, initialize, shutdown):
 
 
 def check_symbol_navigation(executable, initialize, shutdown):
-    """Check definition and hover across scopes and unsaved document versions."""
+    """Check symbol navigation and instruction hover across document versions."""
     uri = "file:///tmp/plangd-definition.ptx"
-    comment = "/* 中文🚀 */"
+    comment = "/* 中文🚀 mov */"
     lines = [
         ".version 8.0",
         ".target sm_90",
@@ -129,6 +129,9 @@ def check_symbol_navigation(executable, initialize, shutdown):
         "done:",
         "  .reg .u32 %tmp<4>;",
         "  mov.u32 %tmp1, 0;",
+        "  {",
+        "    add.u32 %tmp1, %tmp1, 1;",
+        "  }",
         "  ret;",
         "}",
     ]
@@ -171,7 +174,9 @@ def check_symbol_navigation(executable, initialize, shutdown):
             },
         },
     }
-    edited_text = text.replace(".reg .s32 %r1;", ".reg .b32 %r1;")
+    edited_text = text.replace(".reg .s32 %r1;", ".reg .b32 %r1;").replace(
+        "mov.s32 %r1, 2;", "add.s32 %r1, %r1, 2;"
+    )
     process, responses = exchange(
         executable,
         [
@@ -191,6 +196,10 @@ def check_symbol_navigation(executable, initialize, shutdown):
             request(24, position(14, "%missing"), "hover"),
             request(25, position(5, ","), "hover"),
             request(26, position(17, "%tmp1"), "hover"),
+            request(29, position(12, "mov.s32"), "hover"),
+            request(32, position(12, ".s32"), "hover"),
+            request(33, position(19, "add.u32"), "hover"),
+            request(34, position(12, "mov */"), "hover"),
             {
                 "method": "textDocument/didChange",
                 "params": {
@@ -203,6 +212,7 @@ def check_symbol_navigation(executable, initialize, shutdown):
             request(27, position(12, "%r1", shift=1), "hover"),
             request(17, position(12, "%r1", shift=1)),
             request(18, position(13, "done", shift=1)),
+            request(35, position(12, "mov.s32", shift=1), "hover"),
             {
                 "method": "textDocument/didClose",
                 "params": {"textDocument": {"uri": uri}},
@@ -241,9 +251,26 @@ def check_symbol_navigation(executable, initialize, shutdown):
         26: hover(17, "%tmp1", ".reg .u32 %tmp<4>;"),
         27: hover(12, "%r1", ".reg .b32 %r1;", shift=1),
         28: None,
+        34: None,
     }
     for request_id, result in expected.items():
         assert results[request_id].get("result", ...) == result, results[request_id]
+
+    mov = results[29]["result"]
+    assert mov["range"] == symbol_range(12, "mov.s32"), mov
+    assert mov["contents"]["kind"] == "plaintext", mov
+    assert mov["contents"]["value"].startswith("mov{.v4.u32"), mov
+    assert "Move a scalar register" in mov["contents"]["value"], mov
+    assert results[32]["result"] == mov, results[32]
+
+    for request_id, span in [
+        (33, symbol_range(19, "add.u32")),
+        (35, symbol_range(12, "mov.s32", shift=1)),
+    ]:
+        add = results[request_id]["result"]
+        assert add["range"] == span, add
+        assert "Integer add." in add["contents"]["value"], add
+        assert "Standard floating-point add." in add["contents"]["value"], add
 
     markdown_initialize = {
         **initialize[0],
@@ -261,6 +288,7 @@ def check_symbol_navigation(executable, initialize, shutdown):
             *initialize[1:],
             open_document,
             request(30, position(12, "%r1"), "hover"),
+            request(31, position(12, "mov.s32"), "hover"),
             *shutdown,
         ],
     )
@@ -269,6 +297,13 @@ def check_symbol_navigation(executable, initialize, shutdown):
     assert markdown.get("result") == hover(
         12, "%r1", "```ptx\n.reg .s32 %r1;\n```", kind="markdown"
     ), markdown
+    markdown_mov = next(
+        response["result"] for response in responses if response.get("id") == 31
+    )
+    assert markdown_mov["contents"]["kind"] == "markdown", markdown_mov
+    value = markdown_mov["contents"]["value"]
+    assert value.startswith("```ptx\nmov{"), markdown_mov
+    assert "\n```\n\nMove a scalar register" in value, markdown_mov
 
 
 if __name__ == "__main__":
