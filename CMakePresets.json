@@ -1,0 +1,110 @@
+{
+    "version": 8,
+    "configurePresets": [
+        {
+            "name": "ci-linux",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+                "CMAKE_C_COMPILER": "/usr/bin/clang-21",
+                "CMAKE_CXX_COMPILER": "/usr/bin/clang++-21",
+                "CMAKE_AR": "/usr/bin/llvm-ar-21",
+                "CMAKE_RANLIB": "/usr/bin/llvm-ranlib-21",
+                "BUILD_TESTING": "ON",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            }
+        },
+        {
+            "name": "ci-linux-clang-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            },
+            "inherits": "ci-linux"
+        },
+        {
+            "name": "ci-linux-clang-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            },
+            "inherits": "ci-linux"
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "ci-linux-clang-debug",
+            "configurePreset": "ci-linux-clang-debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "ci-linux-clang-release",
+            "configurePreset": "ci-linux-clang-release",
+            "configuration": "Release"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "ci-linux-clang-debug",
+            "configurePreset": "ci-linux-clang-debug",
+            "configuration": "Debug",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "ci-linux-clang-release",
+            "configurePreset": "ci-linux-clang-release",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ],
+    "workflowPresets": [
+        {
+            "name": "ci-linux-clang-debug",
+            "displayName": "Clang CI Debug Build + Test",
+            "description": "Configure, build Debug, run tests",
+            "steps": [
+                {
+                    "name": "ci-linux-clang-debug",
+                    "type": "configure"
+                },
+                {
+                    "name": "ci-linux-clang-debug",
+                    "type": "build"
+                },
+                {
+                    "name": "ci-linux-clang-debug",
+                    "type": "test"
+                }
+            ]
+        },
+        {
+            "name": "ci-linux-clang-release",
+            "displayName": "Clang CI Release Build + Test",
+            "description": "Configure, build Release, run tests",
+            "steps": [
+                {
+                    "name": "ci-linux-clang-release",
+                    "type": "configure"
+                },
+                {
+                    "name": "ci-linux-clang-release",
+                    "type": "build"
+                },
+                {
+                    "name": "ci-linux-clang-release",
+                    "type": "test"
+                }
+            ]
+        }
+    ],
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 28,
+        "patch": 0
+    }
+}

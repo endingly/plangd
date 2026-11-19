@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace plangd {
+
+/// Version of the plangd package used at compile time.
+inline constexpr std::string_view version = "@PROJECT_VERSION@";
+
+}  // namespace plangd

@@ -1,0 +1,22 @@
+@PACKAGE_INIT@
+
+set(@PACKAGE_NAME@_VERSION "@PACKAGE_VERSION@")
+set(@PACKAGE_NAME@_SUPPORTED_COMPONENTS "@PACKAGE_COMPONENTS@")
+
+foreach(_plangd_component IN LISTS @PACKAGE_NAME@_FIND_COMPONENTS)
+    if(_plangd_component IN_LIST @PACKAGE_NAME@_SUPPORTED_COMPONENTS)
+        set(@PACKAGE_NAME@_${_plangd_component}_FOUND TRUE)
+    else()
+        set(@PACKAGE_NAME@_${_plangd_component}_FOUND FALSE)
+    endif()
+endforeach()
+unset(_plangd_component)
+
+check_required_components(@PACKAGE_NAME@)
+if(DEFINED @PACKAGE_NAME@_FOUND AND NOT @PACKAGE_NAME@_FOUND)
+    return()
+endif()
+
+include(CMakeFindDependencyMacro)
+@PACKAGE_DEPENDENCY_CALLS@
+include("${CMAKE_CURRENT_LIST_DIR}/@PACKAGE_NAME@Targets.cmake")
