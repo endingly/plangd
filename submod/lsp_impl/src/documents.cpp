@@ -26,6 +26,8 @@
 namespace plangd {
 namespace {
 
+namespace binding = ptx_frontend::binding;
+
 /// Byte span of one line in the document text, excluding its terminator.
 struct SourceLine {
   std::size_t offset;
@@ -157,6 +159,18 @@ auto coordinates(ptx_frontend::SourcePos point) {
   return std::pair{point.line, point.column};
 }
 
+/// Tests a frontend range with an exclusive end position.
+bool contains(ptx_frontend::SourceRange range, ptx_frontend::SourcePos point) {
+  const auto cursor = coordinates(point);
+  return coordinates(range.start) <= cursor && cursor < coordinates(range.end);
+}
+
+/// Identifies the symbol kinds covered by document-local navigation.
+bool isNavigable(const binding::Symbol& symbol) {
+  return symbol.kind == binding::SymbolKind::Label ||
+         symbol.state_space == ptx_frontend::base::DeclarationStateSpace::Register;
+}
+
 /// Binds the snapshot lazily and shares the same table across symbol features.
 const ptx_frontend::binding::SymbolTable* documentSymbols(Document& document) {
   if (document.cst) {
@@ -169,6 +183,16 @@ const ptx_frontend::binding::SymbolTable* documentSymbols(Document& document) {
   return document.symbols ? &*document.symbols : nullptr;
 }
 
+/// Borrows the bound reference covering the cursor, if one exists.
+const binding::SymbolReference* referenceAt(const binding::SymbolTable& symbols,
+                                            ptx_frontend::SourcePos source) {
+  const auto& references = symbols.references();
+  const auto reference = std::ranges::find_if(references, [&](const auto& ref) {
+    return ref.target && contains(ref.range, source);
+  });
+  return reference == references.end() ? nullptr : &*reference;
+}
+
 /// Resolves a cursor on a register or branch-label reference in this snapshot.
 std::optional<ResolvedReference> findReference(Document& document,
                                                ptx_frontend::SourcePos source) {
@@ -177,21 +201,87 @@ std::optional<ResolvedReference> findReference(Document& document,
     return std::nullopt;
   }
 
-  const auto cursor = coordinates(source);
-  const auto& references = symbols->references();
-  const auto reference = std::ranges::find_if(references, [&](const auto& ref) {
-    return ref.target && coordinates(ref.range.start) <= cursor &&
-           cursor < coordinates(ref.range.end);
-  });
-  if (reference == references.end()) {
+  const auto* reference = referenceAt(*symbols, source);
+  if (!reference) {
     return std::nullopt;
   }
   const auto& symbol = symbols->symbol(reference->target->symbol);
-  if (symbol.kind != ptx_frontend::binding::SymbolKind::Label &&
-      symbol.state_space != ptx_frontend::base::DeclarationStateSpace::Register) {
+  if (!isNavigable(symbol)) {
     return std::nullopt;
   }
   return ResolvedReference{symbol, reference->range};
+}
+
+/// Selects a bound reference or a declaration at the cursor.
+std::optional<binding::SymbolLookup> referenceTargetAt(
+    const binding::SymbolTable& symbols, ptx_frontend::SourcePos source) {
+  if (const auto* reference = referenceAt(symbols, source)) {
+    const auto target = *reference->target;
+    return isNavigable(symbols.symbol(target.symbol)) ? reference->target
+                                                      : std::nullopt;
+  }
+  for (const auto& symbol : symbols.symbols()) {
+    if (!isNavigable(symbol)) {
+      continue;
+    }
+    if (contains(symbol.declaration_range, source) ||
+        std::ranges::any_of(symbols.declarationOccurrences(symbol.id),
+                            [&](const auto& declaration) {
+                              return contains(declaration.range, source);
+                            })) {
+      // Selecting a group declaration covers all of its numbered members.
+      return binding::SymbolLookup{symbol.id, std::nullopt};
+    }
+  }
+  return std::nullopt;
+}
+
+/// Finds bound references in the current snapshot, including declarations on request.
+lsp::TextDocumentReferencesResult findReferences(
+    Document& document, const lsp::DocumentUri& uri, lsp::Position position,
+    bool include_declaration) {
+  const auto source = toSourcePosition(document, position);
+  if (!source) {
+    return nullptr;
+  }
+  const auto* symbols = documentSymbols(document);
+  if (!symbols) {
+    return nullptr;
+  }
+  const auto target = referenceTargetAt(*symbols, *source);
+  if (!target) {
+    return nullptr;
+  }
+
+  std::vector<ptx_frontend::SourceRange> ranges;
+  if (include_declaration) {
+    const auto declarations = symbols->declarationOccurrences(target->symbol);
+    if (declarations.empty()) {
+      ranges.push_back(symbols->symbol(target->symbol).declaration_range);
+    }
+    for (const auto& declaration : declarations) {
+      ranges.push_back(declaration.range);
+    }
+  }
+  for (const auto& reference : symbols->references()) {
+    if (reference.target && reference.target->symbol == target->symbol &&
+        (!target->parameterized_index ||
+         reference.target->parameterized_index == target->parameterized_index)) {
+      ranges.push_back(reference.range);
+    }
+  }
+  std::ranges::sort(ranges, {}, [](const auto& range) {
+    return std::pair{coordinates(range.start), coordinates(range.end)};
+  });
+  const auto duplicates = std::ranges::unique(ranges);
+  ranges.erase(duplicates.begin(), duplicates.end());
+
+  lsp::Array<lsp::Location> locations;
+  locations.reserve(ranges.size());
+  for (const auto& range : ranges) {
+    locations.push_back({.uri = uri, .range = toLspRange(document, range)});
+  }
+  return locations;
 }
 
 /// Returns the declaration location of the reference under the cursor.
@@ -427,6 +517,17 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
           return nullptr;
         }
         return findDefinition(entry->second, entry->first, params.position);
+      });
+
+  endpoint.onTextDocumentReferences(
+      [documents](lsp::ReferenceParams&& params)
+          -> lsp::TextDocumentReferencesResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return findReferences(entry->second, entry->first, params.position,
+                              params.context.includeDeclaration);
       });
 
   endpoint.onTextDocumentCompletion(

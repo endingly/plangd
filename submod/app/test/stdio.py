@@ -461,6 +461,107 @@ def check_instruction_completion(executable, initialize, shutdown):
             assert "Move a scalar register" in move["documentation"], move
 
 
+def check_symbol_references(executable, initialize, shutdown):
+    """Check declaration and reference queries against bound symbol identities."""
+    uri = "file:///tmp/plangd-references.ptx"
+    lines = [
+        ".version 8.0",
+        ".target sm_90",
+        ".address_size 64",
+        ".entry first() {",
+        "  .reg .pred %guard;",
+        "  .reg .u32 %r, %unused;",
+        "  .reg .u32 %tmp<4>;",
+        "  /* 中文🚀 done */ @%guard add.u32 %r, %tmp1, %tmp2;",
+        "  {",
+        "    .reg .u32 %r;",
+        "    add.u32 %r, %r, %tmp1;",
+        "  }",
+        "  bra done;",
+        "done:",
+        "  mov.u32 %r, %missing;",
+        "  ret;",
+        "}",
+        ".entry second() {",
+        "  .reg .u32 %r;",
+        "  mov.u32 %r, 0;",
+        "  bra done;",
+        "done:",
+        "  ret;",
+        "}",
+    ]
+
+    def location(line, spelling, occurrence=0, shift=0):
+        text = lines[line]
+        offset = text.index(spelling)
+        for _ in range(occurrence):
+            offset = text.index(spelling, offset + len(spelling))
+        column = len(text[:offset].encode("utf-16-le")) // 2
+        return {"uri": uri, "range": {
+            "start": {"line": line + shift, "character": column},
+            "end": {"line": line + shift, "character": column + len(spelling)},
+        }}
+
+    def reference(request_id, where, include):
+        return {"id": request_id, "method": "textDocument/references", "params": {
+            "textDocument": {"uri": uri}, "position": where["range"]["start"],
+            "context": {"includeDeclaration": include},
+        }}
+
+    register = location(5, "%r")
+    use = location(7, "%r")
+    last_use = location(14, "%r")
+    unused = location(5, "%unused")
+    inner = [location(10, "%r"), location(10, "%r", occurrence=1)]
+    group = location(6, "%tmp")
+    member_1 = [location(7, "%tmp1"), location(10, "%tmp1")]
+    member_2 = location(7, "%tmp2")
+    cases = [
+        (register, False, [use, last_use]),
+        (use, True, [register, use, last_use]),
+        (inner[1], True, [location(9, "%r"), *inner]),
+        (location(18, "%r"), False, [location(19, "%r")]),
+        (location(7, "%guard"), True, [location(4, "%guard"), location(7, "%guard")]),
+        (group, True, [group, member_1[0], member_2, member_1[1]]),
+        (member_1[1], True, [group, *member_1]),
+        (member_2, False, [member_2]),
+        (location(12, "done"), True, [location(12, "done"), location(13, "done")]),
+        (location(21, "done"), False, [location(20, "done")]),
+        (unused, False, []),
+        (unused, True, [unused]),
+        (location(14, "%missing"), True, None),
+        (location(7, "done"), True, None),
+        (location(13, ":"), True, None),
+    ]
+    text = "\r\n".join(lines)
+    request_ids = range(100, 100 + len(cases))
+    shifted_register = location(5, "%r", shift=1)
+    process, responses = exchange(executable, [
+        *initialize,
+        reference(10, register, True),
+        {"method": "textDocument/didOpen", "params": {"textDocument": {
+            "uri": uri, "languageId": "ptx", "version": 1, "text": text,
+        }}},
+        *(reference(request_id, where, include)
+          for request_id, (where, include, _) in zip(request_ids, cases)),
+        {"method": "textDocument/didChange", "params": {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{"text": "// unsaved edit\r\n"
+                                + text.replace("mov.u32 %r, %missing;", "mov.u32 %r, ;")}],
+        }},
+        reference(11, shifted_register, True),
+        {"method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}},
+        reference(12, shifted_register, True),
+        *shutdown,
+    ])
+    assert process.returncode == 0, process.stderr
+    results = {response["id"]: response for response in responses if "id" in response}
+    assert results[10]["result"] is None and results[12]["result"] is None, results
+    assert results[11]["result"] == [shifted_register, location(7, "%r", shift=1)], results[11]
+    for request_id, (_, _, expected) in zip(request_ids, cases):
+        assert results[request_id]["result"] == expected, (request_id, results[request_id])
+
+
 def check_symbol_completion(executable, initialize, shutdown):
     """Check scope, recovery and edit ranges for symbolic instruction operands."""
     uri = "file:///tmp/plangd-symbol-completion.ptx"
@@ -571,6 +672,7 @@ if __name__ == "__main__":
     capabilities = responses[0]["result"]["capabilities"]
     assert capabilities["positionEncoding"] == "utf-16", capabilities
     assert capabilities["definitionProvider"] is True, capabilities
+    assert capabilities["referencesProvider"] is True, capabilities
     assert capabilities["hoverProvider"] is True, capabilities
     assert capabilities["completionProvider"]["triggerCharacters"] == [".", "%"], capabilities
     assert capabilities["textDocumentSync"] == {
@@ -588,5 +690,6 @@ if __name__ == "__main__":
 
     check_document_sync(executable, initialize, shutdown)
     check_symbol_navigation(executable, initialize, shutdown)
+    check_symbol_references(executable, initialize, shutdown)
     check_instruction_completion(executable, initialize, shutdown)
     check_symbol_completion(executable, initialize, shutdown)

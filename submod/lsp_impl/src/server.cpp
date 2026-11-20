@@ -48,6 +48,7 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
                     },
                     .hoverProvider = true,
                     .definitionProvider = true,
+                    .referencesProvider = true,
                 },
             .serverInfo = lsp::ServerInfo{.name = "plangd", .version = version},
         };
