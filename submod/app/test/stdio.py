@@ -681,6 +681,21 @@ def check_symbol_rename(executable, initialize, shutdown):
         "done:",
         "  ret;",
         "}",
+        ".entry groups() {",
+        "  .reg .u32 %clash5, %bundle1<2>, %tmp<12>, %other<12>;",
+        "  /* 中文🚀 %tmp0 */ add.u32 %tmp0, %tmp11, %unbound0;",
+        "  {",
+        "    .reg .u32 %capture11;",
+        "    mov.u32 %tmp11, %capture11;",
+        "  }",
+        "  { .reg .u32 %tmp<12>; mov.u32 %tmp0, %tmp11; }",
+        "  ret;",
+        "}",
+        ".entry more_groups() {",
+        "  .reg .u32 %huge<1000000000>;",
+        "  mov.u32 %huge999999999, 0;",
+        "  ret;",
+        "}",
     ]
 
     def span(line, spelling, occurrence=0, shift=0):
@@ -714,6 +729,8 @@ def check_symbol_rename(executable, initialize, shutdown):
     branch = span(13, "done")
     group = span(6, "%temp")
     member = span(7, "%temp1")
+    group_decl = span(28, "%tmp")
+    group_uses = [span(29, "%tmp", 1), span(29, "%tmp", 2), span(32, "%tmp")]
     shifted = span(4, "%outer", shift=1)
     text = "\r\n".join(lines)
     open_document = {"method": "textDocument/didOpen", "params": {"textDocument": {
@@ -752,6 +769,18 @@ def check_symbol_rename(executable, initialize, shutdown):
         request(29, member, "%new_temp"),
         request(30, outer, ""),
         request(31, outer),  # Rename computes an edit and leaves the snapshot intact.
+        request(34, group, "%renamed"),
+        request(35, group_decl),
+        request(36, span(29, "%tmp0", 1)),
+        request(37, group_decl, "%buffer"),
+        request(38, group_decl, "%clash"),
+        request(39, group_decl, "%bundle"),
+        request(40, group_decl, "%other"),
+        request(41, group_decl, "%capture"),
+        request(42, group_decl, "%unbound"),
+        request(43, span(38, "%huge"), "%h"),
+        request(44, span(34, "%tmp"), "%local"),
+        request(45, span(29, "%tmp0", 1), "%base"),
         {"method": "textDocument/didChange", "params": {
             "textDocument": {"uri": uri, "version": 2},
             "contentChanges": [{"text": "// unsaved\r\n" + text + "\r\n.global .u32 ;"}],
@@ -765,9 +794,10 @@ def check_symbol_rename(executable, initialize, shutdown):
     results = {response["id"]: response for response in responses if "id" in response}
     assert results[1]["result"]["capabilities"]["renameProvider"] == {"prepareProvider": True}
     expected = {
-        10: None, 13: None, 14: None, 15: None, 16: None,
+        10: None, 14: None, 15: None, 16: None, 36: None,
         11: {"range": uses[1], "placeholder": "%outer"},
         12: {"range": label, "placeholder": "done"},
+        13: {"range": group, "placeholder": "%temp"},
         17: versioned([outer, *uses], "%new_outer"),
         18: versioned([branch, span(15, "done"), label], "finish"),
         19: versioned([span(12, "%outer"), span(12, "%outer", 1)], "%b"),
@@ -775,19 +805,30 @@ def check_symbol_rename(executable, initialize, shutdown):
         31: {"range": outer, "placeholder": "%outer"},
         32: versioned([shifted, span(7, "%outer", 1, 1), span(7, "%outer", 2, 1),
                        span(10, "%outer", shift=1)], "%updated", version=2),
+        34: versioned([group, span(7, "%temp")], "%renamed"),
+        35: {"range": group_decl, "placeholder": "%tmp"},
+        37: versioned([group_decl, *group_uses], "%buffer"),
+        43: versioned([span(38, "%huge"), span(39, "%huge")], "%h"),
+        44: versioned([span(34, "%tmp"), span(34, "%tmp", 1), span(34, "%tmp", 2)],
+                      "%local"),
     }
     for request_id, result in expected.items():
         assert results[request_id].get("result", ...) == result, results[request_id]
-    for request_id in [*range(21, 31), 33]:
+    for request_id in [*range(21, 31), 33, *range(38, 43), 45]:
         error = results[request_id]["error"]
         assert error["code"] == -32803 and error["message"], results[request_id]
 
     process, responses = exchange(executable, [
-        *initialize, open_document, request(17, outer, "%plain"), *shutdown,
+        *initialize, open_document, request(17, outer, "%plain"),
+        request(37, group_decl, "%buffer"), *shutdown,
     ])
     assert process.returncode == 0, process.stderr
     result = next(response for response in responses if response.get("id") == 17)
     assert result["result"] == {"changes": {uri: edits([outer, *uses], "%plain")}}, result
+    group_result = next(response for response in responses if response.get("id") == 37)
+    assert group_result["result"] == {
+        "changes": {uri: edits([group_decl, *group_uses], "%buffer")},
+    }, group_result
 
 
 if __name__ == "__main__":

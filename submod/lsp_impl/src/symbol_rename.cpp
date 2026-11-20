@@ -59,12 +59,12 @@ bool sameTarget(const std::optional<binding::SymbolLookup>& before,
 
 /// Compares binding tables in source traversal order with adjusted locations.
 bool preservesBindings(const binding::SymbolTable& before,
-                       const binding::SymbolTable& after, binding::SymbolId renamed,
+                       const binding::SymbolTable& after, const binding::Symbol& renamed,
                        std::string_view new_name, const RenameCoordinates& positions) {
   // Matching declarations establish a correspondence between the two local ID sets.
   const bool same_declarations = std::ranges::equal(
       before.symbols(), after.symbols(), [&](const auto& old, const auto& edited) {
-        const auto name = old.id == renamed ? new_name : std::string_view(old.name);
+        const auto name = old.id == renamed.id ? new_name : std::string_view(old.name);
         return old.id == edited.id && old.scope == edited.scope &&
                old.kind == edited.kind && old.state_space == edited.state_space &&
                old.parameterized_count == edited.parameterized_count &&
@@ -73,12 +73,21 @@ bool preservesBindings(const binding::SymbolTable& before,
       });
   return same_declarations && std::ranges::equal(
       before.references(), after.references(), [&](const auto& old, const auto& edited) {
-        const auto spelling = old.target && old.target->symbol == renamed
-                                  ? new_name : std::string_view(old.spelling);
-        return old.kind == edited.kind && old.scope == edited.scope &&
-               old.classification == edited.classification &&
-               spelling == edited.spelling && positions.translate(old.range) == edited.range &&
-               sameTarget(old.target, edited.target);
+        if (old.kind != edited.kind || old.scope != edited.scope ||
+            old.classification != edited.classification ||
+            positions.translate(old.range) != edited.range ||
+            !sameTarget(old.target, edited.target)) {
+          return false;
+        }
+        if (!old.target || old.target->symbol != renamed.id) {
+          return old.spelling == edited.spelling;
+        }
+        const std::string_view old_spelling = old.spelling;
+        const std::string_view new_spelling = edited.spelling;
+        return old_spelling.starts_with(renamed.name) &&
+               new_spelling.starts_with(new_name) &&
+               old_spelling.substr(renamed.name.size()) ==
+                   new_spelling.substr(new_name.size());
       });
 }
 
@@ -101,7 +110,7 @@ std::optional<std::string_view> validateSymbolRename(
         range.start.line != range.end.line ||
         range.end.column - range.start.column != static_cast<std::int64_t>(symbol.name.size()) ||
         text.substr(occurrence.offset, symbol.name.size()) != symbol.name) {
-      return "Could not identify all name tokens for this PTX symbol.";
+      return "Could not identify all name ranges for this PTX symbol.";
     }
     edited.append(text.substr(cursor, occurrence.offset - cursor));
     edited.append(new_name);
@@ -129,7 +138,7 @@ std::optional<std::string_view> validateSymbolRename(
   if (duplicate) {
     return "The new name conflicts with another declaration in the same scope.";
   }
-  if (!preservesBindings(symbols, rebound.table, symbol.id, new_name, positions)) {
+  if (!preservesBindings(symbols, rebound.table, symbol, new_name, positions)) {
     return "The new name would change the binding of a PTX symbol or reference.";
   }
   return std::nullopt;

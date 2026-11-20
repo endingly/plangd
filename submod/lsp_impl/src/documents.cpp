@@ -303,13 +303,13 @@ lsp::TextDocumentReferencesResult findReferences(
   return locations;
 }
 
-/// A selected ordinary register or label in the current snapshot.
+/// A selected local register, register group, or label in the current snapshot.
 struct RenameTarget {
   const binding::SymbolTable& symbols;
   SymbolSelection selection;
 };
 
-/// Resolves rename requests to local declarations that have individual names.
+/// Resolves a rename target, requiring the declaration for a register group.
 std::optional<RenameTarget> renameTargetAt(Document& document,
                                           lsp::Position position) {
   const auto source = toSourcePosition(document, position);
@@ -325,7 +325,8 @@ std::optional<RenameTarget> renameTargetAt(Document& document,
     return std::nullopt;
   }
   const auto& symbol = symbols->symbol(selection->lookup.symbol);
-  if (symbol.parameterized_count || symbol.linkage != binding::SymbolLinkage::None ||
+  if (selection->lookup.parameterized_index ||
+      symbol.linkage != binding::SymbolLinkage::None ||
       binding::isSpecialRegister(symbol.name)) {
     return std::nullopt;
   }
@@ -353,15 +354,26 @@ lsp::TextDocumentRenameResult renameSymbol(Document& document,
                                           bool versioned_edits) {
   const auto target = renameTargetAt(document, position);
   if (!target) {
-    throw lsp::RequestError(lsp::MessageError::RequestFailed,
-                            "Select an ordinary PTX register or branch label to rename.");
+    throw lsp::RequestError(
+        lsp::MessageError::RequestFailed,
+        "Select a PTX register, register group declaration, or branch label to rename.");
   }
   const auto& symbol = target->symbols.symbol(target->selection.lookup.symbol);
   if (symbol.name == new_name) {
     return nullptr;
   }
 
-  const auto ranges = symbolOccurrences(target->symbols, target->selection.lookup, true);
+  auto ranges = symbolOccurrences(target->symbols, target->selection.lookup, true);
+  if (symbol.parameterized_count) {
+    const auto base_width = static_cast<std::int32_t>(symbol.name.size());
+    for (auto& range : ranges) {
+      // A group's declaration is already just its base; references add an index.
+      if (range.start.line == range.end.line &&
+          range.end.column - range.start.column > base_width) {
+        range.end.column = range.start.column + base_width;
+      }
+    }
+  }
   std::vector<RenameOccurrence> occurrences;
   occurrences.reserve(ranges.size());
   for (const auto& range : ranges) {

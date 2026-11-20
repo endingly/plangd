@@ -14,7 +14,7 @@ struct Symbol;
 
 namespace plangd {
 
-/// A name token in the original snapshot, with its byte offset into that text.
+/// An editable name or group base and its byte offset into the original text.
 struct RenameOccurrence {
   ptx_frontend::SourceRange range;
   std::size_t offset;
