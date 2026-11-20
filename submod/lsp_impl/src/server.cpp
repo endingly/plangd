@@ -43,6 +43,9 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
         options->diagnostic_related_information =
             document && document->publishDiagnostics &&
             document->publishDiagnostics->relatedInformation.value_or(false);
+        options->hierarchical_document_symbols =
+            document && document->documentSymbol &&
+            document->documentSymbol->hierarchicalDocumentSymbolSupport.value_or(false);
         lsp::OneOf<lsp::Bool, lsp::RenameOptions> rename = true;
         if (document && document->rename && document->rename->prepareSupport.value_or(false)) {
           rename = lsp::RenameOptions{.prepareProvider = true};
@@ -61,6 +64,7 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
                     .hoverProvider = true,
                     .definitionProvider = true,
                     .referencesProvider = true,
+                    .documentSymbolProvider = true,
                     .renameProvider = std::move(rename),
                 },
             .serverInfo = lsp::ServerInfo{.name = "plangd", .version = version},

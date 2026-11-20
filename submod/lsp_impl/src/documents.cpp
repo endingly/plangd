@@ -48,6 +48,7 @@ struct Document {
   std::vector<SourceLine> lines{};
   std::vector<InstructionOccurrence> instructions{};
   std::vector<CompletionTargetRegion> completion_targets{};
+  lsp::Array<lsp::DocumentSymbol> outline{};
   std::optional<ptx_frontend::binding::SymbolTable> symbols{};
 };
 
@@ -139,6 +140,54 @@ std::optional<ptx_frontend::SourcePos> toSourcePosition(
 lsp::Range toLspRange(const Document& document, ptx_frontend::SourceRange range) {
   return {.start = toLspPosition(document, range.start),
           .end = toLspPosition(document, range.end)};
+}
+
+/// Collects module declarations from the CST, including recovered functions.
+lsp::Array<lsp::DocumentSymbol> indexDocumentSymbols(
+    const Document& document, const cst::CstFile& file) {
+  lsp::Array<lsp::DocumentSymbol> outline;
+  const auto* module = file.module();
+  if (!module) {
+    return outline;
+  }
+
+  const auto append = [&](cst::TokenId name, cst::CstTokenRange range,
+                          lsp::SymbolKind kind, const std::string& detail) {
+    const auto& token = file.token(name);
+    outline.push_back({
+        .name = token.text,
+        .kind = kind,
+        .range = toLspRange(document, file.sourceRange(range)),
+        .selectionRange = toLspRange(document, token.range),
+        .detail = detail,
+    });
+  };
+  for (const auto& item : module->items) {
+    if (const auto* function = std::get_if<cst::CstFunction>(&item)) {
+      append(function->name, function->token_range, lsp::SymbolKind::Function,
+             file.token(function->directive).text);
+      continue;
+    }
+    const auto* storage = std::get_if<cst::CstVariableDeclaration>(&item);
+    if (!storage) {
+      continue;
+    }
+    const auto& state_space = file.token(storage->state_space);
+    if (state_space.kind != ptx_frontend::TokenKind::DotGlobal &&
+        state_space.kind != ptx_frontend::TokenKind::DotConst) {
+      continue;
+    }
+    const auto kind = state_space.kind == ptx_frontend::TokenKind::DotConst
+                          ? lsp::SymbolKind::Constant
+                          : lsp::SymbolKind::Variable;
+    for (const auto& declarator : storage->declarators) {
+      // A shared declaration gets a distinct source range for each name.
+      const auto range = storage->declarators.size() == 1 ? storage->token_range
+                                                         : declarator.token_range;
+      append(declarator.name, range, kind, state_space.text);
+    }
+  }
+  return outline;
 }
 
 /// Orders frontend positions by line and byte column.
@@ -265,6 +314,7 @@ void publishDiagnostics(lsp::ServerEndpoint& endpoint,
   if (result) {
     document.instructions = indexInstructions(*result);
     document.completion_targets = indexCompletionTargets(*result);
+    document.outline = indexDocumentSymbols(document, *result);
     auto ast = ptx_frontend::lowerSyntaxModule(*result);
     for (auto& error : ast.diagnostics) {
       params.diagnostics.push_back(documentDiagnostic(document, error.range,
@@ -728,6 +778,27 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
           endpoint.textDocumentPublishDiagnostics(
               {.uri = std::move(uri), .diagnostics = {}});
         }
+      });
+
+  endpoint.onTextDocumentDocumentSymbol(
+      [documents, options](lsp::DocumentSymbolParams&& params)
+          -> lsp::TextDocumentDocumentSymbolResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        if (options->hierarchical_document_symbols) {
+          return entry->second.outline;
+        }
+        lsp::Array<lsp::SymbolInformation> symbols;
+        symbols.reserve(entry->second.outline.size());
+        for (const auto& symbol : entry->second.outline) {
+          symbols.push_back({
+              {.name = symbol.name, .kind = symbol.kind},
+              {.uri = entry->first, .range = symbol.selectionRange},
+          });
+        }
+        return symbols;
       });
 
   endpoint.onTextDocumentDefinition(

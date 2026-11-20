@@ -262,6 +262,114 @@ def check_semantic_diagnostics(executable, initialize, shutdown):
     diagnostic_at(partial_decls, partial_declarations, 17, "3", "power of two")
 
 
+def check_document_outline(executable, initialize, shutdown):
+    """Check outline ranges and replacement using the current editor buffer."""
+    uri = "file:///tmp/plangd-outline.ptx"
+    prefix = "/* 中文🚀 */ "
+    lines = [
+        ".version 8.0",
+        ".target sm_90",
+        ".address_size 64",
+        prefix + ".visible .entry sample_kernel() {",
+        "  .reg .u32 %r;",
+        "  ret;",
+        "}",
+        ".func helper() { ret; }",
+        ".extern .func imported();",
+        ".global .u32 first = 1, second[4];",
+        ".const .u32 limits[2] = {1, 2};",
+        ".shared .u32 omitted;",
+    ]
+
+    def span(source, line, spelling):
+        index = source[line].index(spelling)
+        column = len(source[line][:index].encode("utf-16-le")) // 2
+        return {
+            "start": {"line": line, "character": column},
+            "end": {"line": line, "character": column + len(spelling)},
+        }
+
+    def symbol(source, line, name, kind, detail, declaration, end_line=None):
+        bounds = span(source, line, declaration)
+        if end_line is not None:
+            bounds["end"] = span(source, end_line, "}")["end"]
+        return {
+            "name": name, "kind": kind, "detail": detail,
+            "range": bounds, "selectionRange": span(source, line, name),
+        }
+
+    expected = [
+        symbol(lines, 3, "sample_kernel", 12, ".entry", lines[3].removeprefix(prefix), 6),
+        symbol(lines, 7, "helper", 12, ".func", lines[7]),
+        symbol(lines, 8, "imported", 12, ".func", lines[8]),
+        symbol(lines, 9, "first", 13, ".global", "first = 1"),
+        symbol(lines, 9, "second", 13, ".global", "second[4]"),
+        symbol(lines, 10, "limits", 14, ".const", lines[10]),
+    ]
+    edited = lines.copy()
+    edited[3] = edited[3].replace("sample_kernel", "renamed_kernel")
+    edited[7] = "// helper removed from the editor buffer"
+    updated = [
+        symbol(edited, 3, "renamed_kernel", 12, ".entry", edited[3].removeprefix(prefix), 6),
+        *expected[2:],
+    ]
+    recovering = edited.copy()
+    recovering[4] = "  .reg .u32 ;"
+
+    init = [{
+        **initialize[0], "params": {
+            **initialize[0]["params"], "capabilities": {
+                "textDocument": {"documentSymbol": {
+                    "hierarchicalDocumentSymbolSupport": True,
+                }},
+            },
+        },
+    }, *initialize[1:]]
+    opened = {"method": "textDocument/didOpen", "params": {"textDocument": {
+        "uri": uri, "languageId": "ptx", "version": 1, "text": "\r\n".join(lines),
+    }}}
+
+    def change(version, source):
+        return {"method": "textDocument/didChange", "params": {
+            "textDocument": {"uri": uri, "version": version},
+            "contentChanges": [{"text": "\r\n".join(source)}],
+        }}
+
+    def request(request_id):
+        return {"id": request_id, "method": "textDocument/documentSymbol",
+                "params": {"textDocument": {"uri": uri}}}
+
+    process, responses = exchange(executable, [
+        *init, request(9), opened, request(10),
+        change(2, edited), request(11),
+        change(3, recovering), request(12),
+        change(4, ["// empty outline"]), request(13),
+        {"method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}},
+        request(14), *shutdown,
+    ])
+    assert process.returncode == 0, process.stderr
+    results = {response["id"]: response for response in responses if "id" in response}
+    for request_id, outline in {
+        9: None, 10: expected, 11: updated, 12: updated, 13: [], 14: None,
+    }.items():
+        assert results[request_id].get("result", ...) == outline, results[request_id]
+    recovered = next(
+        response["params"] for response in responses
+        if response.get("method") == "textDocument/publishDiagnostics"
+        and response["params"].get("version") == 3
+    )
+    assert recovered["diagnostics"], recovered
+
+    process, responses = exchange(executable, [*initialize, opened, request(10), *shutdown])
+    assert process.returncode == 0, process.stderr
+    result = next(response for response in responses if response.get("id") == 10)
+    assert result.get("result", ...) == [
+        {"name": item["name"], "kind": item["kind"],
+         "location": {"uri": uri, "range": item["selectionRange"]}}
+        for item in expected
+    ], result
+
+
 def check_symbol_navigation(executable, initialize, shutdown):
     """Check symbol navigation and instruction hover across document versions."""
     uri = "file:///tmp/plangd-definition.ptx"
@@ -1010,6 +1118,7 @@ if __name__ == "__main__":
     assert capabilities["positionEncoding"] == "utf-16", capabilities
     assert capabilities["definitionProvider"] is True, capabilities
     assert capabilities["referencesProvider"] is True, capabilities
+    assert capabilities["documentSymbolProvider"] is True, capabilities
     assert capabilities["renameProvider"] is True, capabilities
     assert capabilities["hoverProvider"] is True, capabilities
     assert capabilities["completionProvider"]["triggerCharacters"] == [".", "%"], capabilities
@@ -1028,6 +1137,7 @@ if __name__ == "__main__":
 
     check_document_sync(executable, initialize, shutdown)
     check_semantic_diagnostics(executable, initialize, shutdown)
+    check_document_outline(executable, initialize, shutdown)
     check_symbol_navigation(executable, initialize, shutdown)
     check_symbol_references(executable, initialize, shutdown)
     check_instruction_completion(executable, initialize, shutdown)

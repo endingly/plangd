@@ -14,6 +14,7 @@ struct DocumentClientOptions {
   lsp::MarkupKind hover_kind;
   bool versioned_edits = false;
   bool diagnostic_related_information = false;
+  bool hierarchical_document_symbols = false;
 };
 
 /// Registers the open-document handlers using the negotiated client options.
