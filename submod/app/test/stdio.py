@@ -650,6 +650,146 @@ def check_symbol_completion(executable, initialize, shutdown):
             assert item["textEdit"] == {"range": edit_range, "newText": label}, item
 
 
+def check_symbol_rename(executable, initialize, shutdown):
+    """Check exact single-document edits and rejection of binding changes."""
+    uri = "file:///tmp/plangd-rename.ptx"
+    lines = [
+        ".version 8.0",
+        ".target sm_90",
+        ".address_size 64",
+        ".entry first() {",
+        "  .reg .u32 %outer, %unused;",
+        "  .reg .pred %guard;",
+        "  .reg .u32 %temp<4>;",
+        "  /* 中文🚀 %outer done */ @%guard add.u32 %outer, %outer, %temp1;",
+        "  {",
+        "    .reg .u32 %inner;",
+        "    mov.u32 %outer, %inner;",
+        "  }",
+        "  { .reg .u32 %outer; mov.u32 %outer, 0; }",
+        "  bra done;",
+        "other:",
+        "  bra done;",
+        "done:",
+        "  mov.u32 %unused, %unbound;",
+        "  ret;",
+        "}",
+        ".entry second() {",
+        "  .reg .u32 %outer;",
+        "  mov.u32 %outer, 0;",
+        "  bra done;",
+        "done:",
+        "  ret;",
+        "}",
+    ]
+
+    def span(line, spelling, occurrence=0, shift=0):
+        text = lines[line]
+        offset = text.index(spelling)
+        for _ in range(occurrence):
+            offset = text.index(spelling, offset + len(spelling))
+        column = len(text[:offset].encode("utf-16-le")) // 2
+        return {"start": {"line": line + shift, "character": column},
+                "end": {"line": line + shift, "character": column + len(spelling)}}
+
+    def request(request_id, at, new_name=None):
+        params = {"textDocument": {"uri": uri}, "position": at["start"]}
+        method = "prepareRename"
+        if new_name is not None:
+            method = "rename"
+            params["newName"] = new_name
+        return {"id": request_id, "method": f"textDocument/{method}", "params": params}
+
+    def edits(ranges, spelling):
+        return [{"range": edit_range, "newText": spelling} for edit_range in ranges]
+
+    def versioned(ranges, spelling, version=1):
+        return {"documentChanges": [{"textDocument": {"uri": uri, "version": version},
+                                     "edits": edits(ranges, spelling)}]}
+
+    outer = span(4, "%outer")
+    uses = [span(7, "%outer", 1), span(7, "%outer", 2), span(10, "%outer")]
+    inner = span(9, "%inner")
+    label = span(16, "done")
+    branch = span(13, "done")
+    group = span(6, "%temp")
+    member = span(7, "%temp1")
+    shifted = span(4, "%outer", shift=1)
+    text = "\r\n".join(lines)
+    open_document = {"method": "textDocument/didOpen", "params": {"textDocument": {
+        "uri": uri, "languageId": "ptx", "version": 1, "text": text,
+    }}}
+    init = [{
+        **initialize[0], "params": {
+            **initialize[0]["params"], "capabilities": {
+                "textDocument": {"rename": {"prepareSupport": True}},
+                "workspace": {"workspaceEdit": {"documentChanges": True}},
+            },
+        },
+    }, *initialize[1:]]
+    process, responses = exchange(executable, [
+        *init,
+        request(10, outer),
+        open_document,
+        request(11, uses[1]),
+        request(12, label),
+        request(13, group),
+        request(14, member),
+        request(15, span(7, "%outer")),  # Comment spelling.
+        request(16, outer, "%outer"),
+        request(17, uses[0], "%new_outer"),
+        request(18, branch, "finish"),
+        request(19, span(12, "%outer", 1), "%b"),
+        request(20, span(7, "%guard"), "%p"),
+        request(21, outer, "%unused"),
+        request(22, outer, "%inner"),
+        request(23, inner, "%outer"),
+        request(24, outer, "%unbound"),
+        request(25, outer, "%temp1"),
+        request(26, label, "other"),
+        request(27, outer, "%tid"),
+        request(28, outer, "%bad name"),
+        request(29, member, "%new_temp"),
+        request(30, outer, ""),
+        request(31, outer),  # Rename computes an edit and leaves the snapshot intact.
+        {"method": "textDocument/didChange", "params": {
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{"text": "// unsaved\r\n" + text + "\r\n.global .u32 ;"}],
+        }},
+        request(32, shifted, "%updated"),
+        {"method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}},
+        request(33, shifted, "%updated"),
+        *shutdown,
+    ])
+    assert process.returncode == 0, process.stderr
+    results = {response["id"]: response for response in responses if "id" in response}
+    assert results[1]["result"]["capabilities"]["renameProvider"] == {"prepareProvider": True}
+    expected = {
+        10: None, 13: None, 14: None, 15: None, 16: None,
+        11: {"range": uses[1], "placeholder": "%outer"},
+        12: {"range": label, "placeholder": "done"},
+        17: versioned([outer, *uses], "%new_outer"),
+        18: versioned([branch, span(15, "done"), label], "finish"),
+        19: versioned([span(12, "%outer"), span(12, "%outer", 1)], "%b"),
+        20: versioned([span(5, "%guard"), span(7, "%guard")], "%p"),
+        31: {"range": outer, "placeholder": "%outer"},
+        32: versioned([shifted, span(7, "%outer", 1, 1), span(7, "%outer", 2, 1),
+                       span(10, "%outer", shift=1)], "%updated", version=2),
+    }
+    for request_id, result in expected.items():
+        assert results[request_id].get("result", ...) == result, results[request_id]
+    for request_id in [*range(21, 31), 33]:
+        error = results[request_id]["error"]
+        assert error["code"] == -32803 and error["message"], results[request_id]
+
+    process, responses = exchange(executable, [
+        *initialize, open_document, request(17, outer, "%plain"), *shutdown,
+    ])
+    assert process.returncode == 0, process.stderr
+    result = next(response for response in responses if response.get("id") == 17)
+    assert result["result"] == {"changes": {uri: edits([outer, *uses], "%plain")}}, result
+
+
 if __name__ == "__main__":
     executable, version = sys.argv[1:]
     version_result = subprocess.run(
@@ -673,6 +813,7 @@ if __name__ == "__main__":
     assert capabilities["positionEncoding"] == "utf-16", capabilities
     assert capabilities["definitionProvider"] is True, capabilities
     assert capabilities["referencesProvider"] is True, capabilities
+    assert capabilities["renameProvider"] is True, capabilities
     assert capabilities["hoverProvider"] is True, capabilities
     assert capabilities["completionProvider"]["triggerCharacters"] == [".", "%"], capabilities
     assert capabilities["textDocumentSync"] == {
@@ -693,3 +834,4 @@ if __name__ == "__main__":
     check_symbol_references(executable, initialize, shutdown)
     check_instruction_completion(executable, initialize, shutdown)
     check_symbol_completion(executable, initialize, shutdown)
+    check_symbol_rename(executable, initialize, shutdown)

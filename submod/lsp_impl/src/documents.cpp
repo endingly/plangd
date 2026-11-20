@@ -13,6 +13,7 @@
 #include <variant>
 #include <vector>
 
+#include <lsp/error.h>
 #include <lsp/server_endpoint.h>
 #include <ptx_frontend/binding/ptx_symbol_table.hpp>
 #include <ptx_frontend/cst/ptx_cst_parser.hpp>
@@ -22,6 +23,7 @@
 #include "completion_target.hpp"
 #include "instruction_docs.hpp"
 #include "symbol_completion.hpp"
+#include "symbol_rename.hpp"
 
 namespace plangd {
 namespace {
@@ -49,6 +51,12 @@ struct Document {
 /// A bound symbol and the range of the reference under the cursor.
 struct ResolvedReference {
   const ptx_frontend::binding::Symbol& symbol;
+  ptx_frontend::SourceRange range;
+};
+
+/// A local symbol identity and the exact token selected under the cursor.
+struct SymbolSelection {
+  binding::SymbolLookup lookup;
   ptx_frontend::SourceRange range;
 };
 
@@ -213,27 +221,60 @@ std::optional<ResolvedReference> findReference(Document& document,
 }
 
 /// Selects a bound reference or a declaration at the cursor.
-std::optional<binding::SymbolLookup> referenceTargetAt(
+std::optional<SymbolSelection> symbolAt(
     const binding::SymbolTable& symbols, ptx_frontend::SourcePos source) {
   if (const auto* reference = referenceAt(symbols, source)) {
     const auto target = *reference->target;
-    return isNavigable(symbols.symbol(target.symbol)) ? reference->target
-                                                      : std::nullopt;
+    if (isNavigable(symbols.symbol(target.symbol))) {
+      return SymbolSelection{target, reference->range};
+    }
+    return std::nullopt;
   }
   for (const auto& symbol : symbols.symbols()) {
     if (!isNavigable(symbol)) {
       continue;
     }
-    if (contains(symbol.declaration_range, source) ||
-        std::ranges::any_of(symbols.declarationOccurrences(symbol.id),
-                            [&](const auto& declaration) {
-                              return contains(declaration.range, source);
-                            })) {
-      // Selecting a group declaration covers all of its numbered members.
-      return binding::SymbolLookup{symbol.id, std::nullopt};
+    // Selecting a group declaration covers all of its numbered members.
+    const binding::SymbolLookup lookup{symbol.id, std::nullopt};
+    if (contains(symbol.declaration_range, source)) {
+      return SymbolSelection{lookup, symbol.declaration_range};
+    }
+    for (const auto& declaration : symbols.declarationOccurrences(symbol.id)) {
+      if (contains(declaration.range, source)) {
+        return SymbolSelection{lookup, declaration.range};
+      }
     }
   }
   return std::nullopt;
+}
+
+/// Collects the selected declaration and use sites in source order.
+std::vector<ptx_frontend::SourceRange> symbolOccurrences(
+    const binding::SymbolTable& symbols, binding::SymbolLookup target,
+    bool include_declaration) {
+  std::vector<ptx_frontend::SourceRange> ranges;
+  if (include_declaration) {
+    const auto declarations = symbols.declarationOccurrences(target.symbol);
+    if (declarations.empty()) {
+      ranges.push_back(symbols.symbol(target.symbol).declaration_range);
+    }
+    for (const auto& declaration : declarations) {
+      ranges.push_back(declaration.range);
+    }
+  }
+  for (const auto& reference : symbols.references()) {
+    if (reference.target && reference.target->symbol == target.symbol &&
+        (!target.parameterized_index ||
+         reference.target->parameterized_index == target.parameterized_index)) {
+      ranges.push_back(reference.range);
+    }
+  }
+  std::ranges::sort(ranges, {}, [](const auto& range) {
+    return std::pair{coordinates(range.start), coordinates(range.end)};
+  });
+  const auto duplicates = std::ranges::unique(ranges);
+  ranges.erase(duplicates.begin(), duplicates.end());
+  return ranges;
 }
 
 /// Finds bound references in the current snapshot, including declarations on request.
@@ -248,40 +289,109 @@ lsp::TextDocumentReferencesResult findReferences(
   if (!symbols) {
     return nullptr;
   }
-  const auto target = referenceTargetAt(*symbols, *source);
+  const auto target = symbolAt(*symbols, *source);
   if (!target) {
     return nullptr;
   }
 
-  std::vector<ptx_frontend::SourceRange> ranges;
-  if (include_declaration) {
-    const auto declarations = symbols->declarationOccurrences(target->symbol);
-    if (declarations.empty()) {
-      ranges.push_back(symbols->symbol(target->symbol).declaration_range);
-    }
-    for (const auto& declaration : declarations) {
-      ranges.push_back(declaration.range);
-    }
-  }
-  for (const auto& reference : symbols->references()) {
-    if (reference.target && reference.target->symbol == target->symbol &&
-        (!target->parameterized_index ||
-         reference.target->parameterized_index == target->parameterized_index)) {
-      ranges.push_back(reference.range);
-    }
-  }
-  std::ranges::sort(ranges, {}, [](const auto& range) {
-    return std::pair{coordinates(range.start), coordinates(range.end)};
-  });
-  const auto duplicates = std::ranges::unique(ranges);
-  ranges.erase(duplicates.begin(), duplicates.end());
-
+  const auto ranges = symbolOccurrences(*symbols, target->lookup, include_declaration);
   lsp::Array<lsp::Location> locations;
   locations.reserve(ranges.size());
   for (const auto& range : ranges) {
     locations.push_back({.uri = uri, .range = toLspRange(document, range)});
   }
   return locations;
+}
+
+/// A selected ordinary register or label in the current snapshot.
+struct RenameTarget {
+  const binding::SymbolTable& symbols;
+  SymbolSelection selection;
+};
+
+/// Resolves rename requests to local declarations that have individual names.
+std::optional<RenameTarget> renameTargetAt(Document& document,
+                                          lsp::Position position) {
+  const auto source = toSourcePosition(document, position);
+  if (!source) {
+    return std::nullopt;
+  }
+  const auto* symbols = documentSymbols(document);
+  if (!symbols) {
+    return std::nullopt;
+  }
+  const auto selection = symbolAt(*symbols, *source);
+  if (!selection) {
+    return std::nullopt;
+  }
+  const auto& symbol = symbols->symbol(selection->lookup.symbol);
+  if (symbol.parameterized_count || symbol.linkage != binding::SymbolLinkage::None ||
+      binding::isSpecialRegister(symbol.name)) {
+    return std::nullopt;
+  }
+  return RenameTarget{*symbols, *selection};
+}
+
+/// Reports the selected spelling and its exact range for the editor input box.
+lsp::TextDocumentPrepareRenameResult prepareRename(Document& document,
+                                                   lsp::Position position) {
+  const auto target = renameTargetAt(document, position);
+  if (!target) {
+    return nullptr;
+  }
+  return lsp::PrepareRenameResult{lsp::PrepareRenamePlaceholder{
+      .range = toLspRange(document, target->selection.range),
+      .placeholder = target->symbols.symbol(target->selection.lookup.symbol).name,
+  }};
+}
+
+/// Computes a complete rename edit from the current buffer without mutating it.
+lsp::TextDocumentRenameResult renameSymbol(Document& document,
+                                          const lsp::DocumentUri& uri,
+                                          lsp::Position position,
+                                          const std::string& new_name,
+                                          bool versioned_edits) {
+  const auto target = renameTargetAt(document, position);
+  if (!target) {
+    throw lsp::RequestError(lsp::MessageError::RequestFailed,
+                            "Select an ordinary PTX register or branch label to rename.");
+  }
+  const auto& symbol = target->symbols.symbol(target->selection.lookup.symbol);
+  if (symbol.name == new_name) {
+    return nullptr;
+  }
+
+  const auto ranges = symbolOccurrences(target->symbols, target->selection.lookup, true);
+  std::vector<RenameOccurrence> occurrences;
+  occurrences.reserve(ranges.size());
+  for (const auto& range : ranges) {
+    const auto& line = document.lines.at(static_cast<std::size_t>(range.start.line - 1));
+    occurrences.push_back(
+        {range, line.offset + static_cast<std::size_t>(range.start.column - 1)});
+  }
+  if (const auto error = validateSymbolRename(document.text, target->symbols, symbol,
+                                               occurrences, new_name)) {
+    throw lsp::RequestError(lsp::MessageError::RequestFailed, std::string(*error));
+  }
+
+  lsp::WorkspaceEdit result;
+  if (versioned_edits) {
+    lsp::TextDocumentEdit edit;
+    edit.textDocument.uri = uri;
+    edit.textDocument.version = document.version;
+    edit.edits.reserve(ranges.size());
+    for (const auto& range : ranges) {
+      edit.edits.emplace_back(lsp::TextEdit{toLspRange(document, range), new_name});
+    }
+    result.documentChanges.emplace().emplace_back(std::move(edit));
+  } else {
+    auto& edits = result.changes.emplace()[uri];
+    edits.reserve(ranges.size());
+    for (const auto& range : ranges) {
+      edits.push_back({toLspRange(document, range), new_name});
+    }
+  }
+  return result;
 }
 
 /// Returns the declaration location of the reference under the cursor.
@@ -466,7 +576,7 @@ lsp::TextDocumentCompletionResult completeInstruction(Document& document,
 }  // namespace
 
 void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
-                              std::shared_ptr<const lsp::MarkupKind> hover_kind) {
+                              std::shared_ptr<const DocumentClientOptions> options) {
   using Documents = std::unordered_map<lsp::DocumentUri, Document>;
   auto documents = std::make_shared<Documents>();
   endpoint.onTextDocumentDidOpen(
@@ -530,6 +640,28 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
                               params.context.includeDeclaration);
       });
 
+  endpoint.onTextDocumentPrepareRename(
+      [documents](lsp::PrepareRenameParams&& params)
+          -> lsp::TextDocumentPrepareRenameResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return prepareRename(entry->second, params.position);
+      });
+
+  endpoint.onTextDocumentRename(
+      [documents, options](lsp::RenameParams&& params)
+          -> lsp::TextDocumentRenameResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          throw lsp::RequestError(lsp::MessageError::RequestFailed,
+                                  "The PTX document is not open.");
+        }
+        return renameSymbol(entry->second, entry->first, params.position,
+                            params.newName, options->versioned_edits);
+      });
+
   endpoint.onTextDocumentCompletion(
       [documents](lsp::CompletionParams&& params)
           -> lsp::TextDocumentCompletionResult {
@@ -541,13 +673,13 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
       });
 
   endpoint.onTextDocumentHover(
-      [documents, hover_kind = std::move(hover_kind)](lsp::HoverParams&& params)
+      [documents, options = std::move(options)](lsp::HoverParams&& params)
           -> lsp::TextDocumentHoverResult {
         const auto entry = documents->find(params.textDocument.uri);
         if (entry == documents->end()) {
           return nullptr;
         }
-        return findHover(entry->second, params.position, *hover_kind);
+        return findHover(entry->second, params.position, options->hover_kind);
       });
 }
 

@@ -31,10 +31,19 @@ lsp::MarkupKind hoverKind(const lsp::ClientCapabilities& capabilities) {
 
 void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
                       bool& shutdown_requested) {
-  auto hover_kind = std::make_shared<lsp::MarkupKind>(lsp::MarkupKind::PlainText);
+  auto options = std::make_shared<DocumentClientOptions>(
+      DocumentClientOptions{.hover_kind = lsp::MarkupKind::PlainText});
   endpoint.onInitialize(
-      [version = std::string(version), hover_kind](lsp::InitializeParams&& params) {
-        *hover_kind = hoverKind(params.capabilities);
+      [version = std::string(version), options](lsp::InitializeParams&& params) {
+        options->hover_kind = hoverKind(params.capabilities);
+        const auto& workspace = params.capabilities.workspace;
+        options->versioned_edits = workspace && workspace->workspaceEdit &&
+                                  workspace->workspaceEdit->documentChanges.value_or(false);
+        const auto& document = params.capabilities.textDocument;
+        lsp::OneOf<lsp::Bool, lsp::RenameOptions> rename = true;
+        if (document && document->rename && document->rename->prepareSupport.value_or(false)) {
+          rename = lsp::RenameOptions{.prepareProvider = true};
+        }
         return lsp::InitializeResult{
             .capabilities =
                 {
@@ -49,6 +58,7 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
                     .hoverProvider = true,
                     .definitionProvider = true,
                     .referencesProvider = true,
+                    .renameProvider = std::move(rename),
                 },
             .serverInfo = lsp::ServerInfo{.name = "plangd", .version = version},
         };
@@ -59,7 +69,7 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
     return {};
   });
   endpoint.onExit([] {});
-  registerDocumentHandlers(endpoint, hover_kind);
+  registerDocumentHandlers(endpoint, options);
 }
 
 }  // namespace plangd

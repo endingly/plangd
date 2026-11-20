@@ -52,6 +52,7 @@ add_library(plangd_lsp_impl STATIC
     src/instruction_docs.cpp
     src/server.cpp
     src/symbol_completion.cpp
+    src/symbol_rename.cpp
     "${instruction_docs_header}"
     "${instruction_docs_source}"
     "${instruction_modifiers_header}"

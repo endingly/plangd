@@ -9,8 +9,14 @@ enum class MarkupKind;
 
 namespace plangd {
 
-/// Registers the open-document handlers using the negotiated hover format.
+/// Client capabilities needed when formatting document responses.
+struct DocumentClientOptions {
+  lsp::MarkupKind hover_kind;
+  bool versioned_edits = false;
+};
+
+/// Registers the open-document handlers using the negotiated client options.
 void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
-                              std::shared_ptr<const lsp::MarkupKind> hover_kind);
+                              std::shared_ptr<const DocumentClientOptions> options);
 
 }  // namespace plangd
