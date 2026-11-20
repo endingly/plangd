@@ -461,6 +461,94 @@ def check_instruction_completion(executable, initialize, shutdown):
             assert "Move a scalar register" in move["documentation"], move
 
 
+def check_symbol_completion(executable, initialize, shutdown):
+    """Check scope, recovery and edit ranges for symbolic instruction operands."""
+    uri = "file:///tmp/plangd-symbol-completion.ptx"
+    header = ".version 8.0\r\n.target sm_90\r\n.address_size 64\r\n"
+    before = header + ".entry foreign() { .reg .u32 %r_foreign; loop_foreign: ret; }\r\n"
+    kernel = before + ".entry example() {\r\n"
+    registers = kernel + "  .reg .u32 %r<4>;\r\n"
+    group = {f"%r{index}": ".reg .u32 %r<4>;" for index in range(4)}
+    large = kernel + "  .reg .u32 %big<1000000000>;\r\n"
+    cases = [
+        (registers + "  mov.u32 %|", "%", group),
+        (registers + "  /* 中文🚀 */ mov.u32 %r|junk, 0;", "%rjunk", group),
+        (registers + "  mov.u32 %r0, |", "", group),
+        (registers + "  ld.global.u32 %r0, [%r|+4];", "%r", group),
+        (registers + "  { .reg .s32 %r1; mov.s32 %r|", "%r",
+         {**group, "%r1": ".reg .s32 %r1;"}),
+        (registers + "  { .reg .s32 %r_nested; ret; } mov.u32 %r|", "%r", group),
+        (registers + "  .reg .u32 plain; mov.u32 pl|", "pl", {"plain": ".reg .u32 plain;"}),
+        (registers + "  mov.u32 %missing|", "%missing", None),
+        (registers + "  // mov.u32 %r|", "%r", None),
+        (registers + "  .reg .u32 %r|", "%r", None),
+        (registers + "  @%r|", "%r", None),
+        (registers + "  @!%p mov.u32 %r|1, 0;", "%r1", group),
+        (kernel + "  bra.uni loo|\r\n  loop_local: ret;\r\n}", "loo",
+         {"loop_local": "loop_local:"}),
+        (kernel + "  { loop_nested: ret; }\r\n  bra |", "", {"loop_nested": "loop_nested:"}),
+        (kernel + "  loop_local: bra loop_local, loo|", "loo", None),
+        (kernel + "  bra loo|", "loo", None),
+        (large + "  mov.u32 %big|", "%big",
+         {f"%big{index}": ".reg .u32 %big<1000000000>;" for index in range(256)}),
+        (large + "  mov.u32 %big999999999|", "%big999999999",
+         {"%big999999999": ".reg .u32 %big<1000000000>;"}),
+    ]
+
+    def utf16(text):
+        return len(text.encode("utf-16-le")) // 2
+
+    messages = [*initialize, {"method": "textDocument/didOpen", "params": {
+        "textDocument": {"uri": uri, "languageId": "ptx", "version": 0, "text": header},
+    }}]
+    expected = {}
+    for request_id, (marked, fragment, declarations) in enumerate(cases, start=100):
+        left, right = marked.split("|")
+        prefix = left.rsplit("\r\n", 1)[-1]
+        line = left.count("\r\n")
+        current_line = prefix + right.split("\r\n", 1)[0]
+        start = current_line.rfind(fragment, max(0, len(prefix) - len(fragment)),
+                                   len(prefix) + len(fragment))
+        assert start >= 0, marked
+        edit_range = {
+            "start": {"line": line, "character": utf16(prefix[:start])},
+            "end": {"line": line, "character": utf16(prefix[:start] + fragment)},
+        }
+        expected[request_id] = (edit_range, declarations, fragment == "%big")
+        messages.extend([
+            {"method": "textDocument/didChange", "params": {
+                "textDocument": {"uri": uri, "version": request_id},
+                "contentChanges": [{"text": left + right}],
+            }},
+            {"method": "textDocument/completion", "id": request_id, "params": {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": utf16(prefix)},
+                **({"context": {"triggerKind": 2, "triggerCharacter": "%"}}
+                   if fragment == "%" else {}),
+            }},
+        ])
+
+    process, responses = exchange(executable, [*messages, *shutdown])
+    assert process.returncode == 0, process.stderr
+    results = {response["id"]: response for response in responses if "id" in response}
+    for request_id, (edit_range, declarations, incomplete) in expected.items():
+        result = results[request_id]["result"]
+        if declarations is None:
+            assert result is None, (request_id, result)
+            continue
+        assert result is not None, cases[request_id - 100][0]
+        if incomplete:
+            assert result["isIncomplete"] is True, (request_id, result)
+            result = result["items"]
+        assert [item["label"] for item in result] == sorted(declarations), (request_id, result)
+        for item in result:
+            label = item["label"]
+            detail = declarations[label]
+            assert item["kind"] == (18 if detail.endswith(":") else 6), item
+            assert item["detail"] == detail, item
+            assert item["textEdit"] == {"range": edit_range, "newText": label}, item
+
+
 if __name__ == "__main__":
     executable, version = sys.argv[1:]
     version_result = subprocess.run(
@@ -484,7 +572,7 @@ if __name__ == "__main__":
     assert capabilities["positionEncoding"] == "utf-16", capabilities
     assert capabilities["definitionProvider"] is True, capabilities
     assert capabilities["hoverProvider"] is True, capabilities
-    assert capabilities["completionProvider"]["triggerCharacters"] == ["."], capabilities
+    assert capabilities["completionProvider"]["triggerCharacters"] == [".", "%"], capabilities
     assert capabilities["textDocumentSync"] == {
         "openClose": True, "change": 1,
     }, capabilities
@@ -501,3 +589,4 @@ if __name__ == "__main__":
     check_document_sync(executable, initialize, shutdown)
     check_symbol_navigation(executable, initialize, shutdown)
     check_instruction_completion(executable, initialize, shutdown)
+    check_symbol_completion(executable, initialize, shutdown)

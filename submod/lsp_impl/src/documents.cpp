@@ -21,6 +21,7 @@
 #include "completion.hpp"
 #include "completion_target.hpp"
 #include "instruction_docs.hpp"
+#include "symbol_completion.hpp"
 
 namespace plangd {
 namespace {
@@ -38,7 +39,7 @@ struct Document {
   std::vector<SourceLine> lines{};
   std::vector<InstructionOccurrence> instructions{};
   std::vector<CompletionTargetRegion> completion_targets{};
-  // Retain the CST until the first navigation request builds the symbol table.
+  // Retain the CST until the first symbol request builds the symbol table.
   std::optional<ptx_frontend::syntax_cst::CstFile> cst{};
   std::optional<ptx_frontend::binding::SymbolTable> symbols{};
 };
@@ -156,9 +157,8 @@ auto coordinates(ptx_frontend::SourcePos point) {
   return std::pair{point.line, point.column};
 }
 
-/// Resolves a cursor on a register or branch-label reference in this snapshot.
-std::optional<ResolvedReference> findReference(Document& document,
-                                               ptx_frontend::SourcePos source) {
+/// Binds the snapshot lazily and shares the same table across symbol features.
+const ptx_frontend::binding::SymbolTable* documentSymbols(Document& document) {
   if (document.cst) {
     auto ast = ptx_frontend::lowerSyntaxModule(*document.cst);
     if (ast) {
@@ -166,12 +166,19 @@ std::optional<ResolvedReference> findReference(Document& document,
     }
     document.cst.reset();
   }
-  if (!document.symbols) {
+  return document.symbols ? &*document.symbols : nullptr;
+}
+
+/// Resolves a cursor on a register or branch-label reference in this snapshot.
+std::optional<ResolvedReference> findReference(Document& document,
+                                               ptx_frontend::SourcePos source) {
+  const auto* symbols = documentSymbols(document);
+  if (!symbols) {
     return std::nullopt;
   }
 
   const auto cursor = coordinates(source);
-  const auto& references = document.symbols->references();
+  const auto& references = symbols->references();
   const auto reference = std::ranges::find_if(references, [&](const auto& ref) {
     return ref.target && coordinates(ref.range.start) <= cursor &&
            cursor < coordinates(ref.range.end);
@@ -179,7 +186,7 @@ std::optional<ResolvedReference> findReference(Document& document,
   if (reference == references.end()) {
     return std::nullopt;
   }
-  const auto& symbol = document.symbols->symbol(reference->target->symbol);
+  const auto& symbol = symbols->symbol(reference->target->symbol);
   if (symbol.kind != ptx_frontend::binding::SymbolKind::Label &&
       symbol.state_space != ptx_frontend::base::DeclarationStateSpace::Register) {
     return std::nullopt;
@@ -290,16 +297,18 @@ lsp::TextDocumentHoverResult findHover(Document& document, lsp::Position positio
 }
 
 /// Builds a completion item that replaces the requested single-line range.
-lsp::CompletionItem completionItem(std::string_view spelling, lsp::Range range) {
+lsp::CompletionItem completionItem(
+    std::string_view spelling, lsp::Range range,
+    lsp::CompletionItemKind kind = lsp::CompletionItemKind::Keyword) {
   return {
       .label = std::string(spelling),
-      .kind = lsp::CompletionItemKind::Keyword,
+      .kind = kind,
       .textEdit = lsp::TextEdit{.range = range, .newText = std::string(spelling)},
   };
 }
 
-/// Completes instruction heads against the current document snapshot.
-lsp::TextDocumentCompletionResult completeInstruction(const Document& document,
+/// Completes instruction heads and symbolic operands in the current snapshot.
+lsp::TextDocumentCompletionResult completeInstruction(Document& document,
                                                       lsp::Position position) {
   const auto source = toSourcePosition(document, position);
   if (!source) {
@@ -312,6 +321,30 @@ lsp::TextDocumentCompletionResult completeInstruction(const Document& document,
   }
 
   lsp::Array<lsp::CompletionItem> items;
+  if (const auto* symbol = std::get_if<SymbolCompletion>(&*context)) {
+    const auto* table = documentSymbols(document);
+    if (!table) {
+      return nullptr;
+    }
+    const auto candidates = completeSymbols(*table, *symbol);
+    const auto range = toLspRange(document, symbol->range);
+    const auto kind = symbol->kind == OperandSymbolKind::Register
+                          ? lsp::CompletionItemKind::Variable
+                          : lsp::CompletionItemKind::Reference;
+    for (const auto& candidate : candidates.items) {
+      auto item = completionItem(candidate.spelling, range, kind);
+      item.detail = describeSymbol(*candidate.declaration);
+      items.push_back(std::move(item));
+    }
+    if (candidates.incomplete) {
+      return lsp::CompletionList{.isIncomplete = true, .items = std::move(items)};
+    }
+    if (items.empty()) {
+      return nullptr;
+    }
+    return items;
+  }
+
   const auto* target = completionTargetAt(document.completion_targets, *source);
   if (const auto* modifier = std::get_if<ModifierCompletion>(&*context)) {
     for (const auto& candidate : modifierCandidates(*modifier, line, target)) {

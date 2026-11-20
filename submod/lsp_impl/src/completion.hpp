@@ -34,15 +34,26 @@ struct ModifierCompletion {
   ptx_frontend::SourceRange range;
 };
 
+enum class OperandSymbolKind { Register, BranchLabel };
+
+/// An operand spelling and the instruction position identifying its scope.
+struct SymbolCompletion {
+  OperandSymbolKind kind;
+  ptx_frontend::SourcePos instruction;
+  std::string prefix;
+  ptx_frontend::SourceRange range;
+};
+
 /// A modifier spelling from the generated table and the source it replaces.
 struct ModifierCandidate {
   std::string_view spelling;
   ptx_frontend::SourceRange range;
 };
 
-using InstructionCompletion = std::variant<MnemonicCompletion, ModifierCompletion>;
+using InstructionCompletion =
+    std::variant<MnemonicCompletion, ModifierCompletion, SymbolCompletion>;
 
-/// Finds a position to complete in the instruction head, even in unfinished code.
+/// Finds a position to complete in an instruction, even in unfinished code.
 std::optional<InstructionCompletion> instructionCompletionAt(
     std::string_view text, std::string_view cursor_line,
     ptx_frontend::SourcePos cursor);

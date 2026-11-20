@@ -11,6 +11,7 @@
 #include <ptx_frontend/lexer/ptx_lexer.hpp>
 #include <ptx_frontend/resolved_ir/ptx_resolved_ir_checker_support.hpp>
 
+#include "instruction_docs.gen.hpp"
 #include "instruction_modifiers.gen.hpp"
 
 namespace plangd {
@@ -34,6 +35,29 @@ enum class BodyPosition {
   Statement,
 };
 
+/// A recognized instruction whose operands may still be under the cursor.
+struct OperandContext {
+  SourcePos instruction;
+  OperandSymbolKind kind;
+  std::optional<TokenKind> previous;
+
+  /// A direct branch accepts only its first operand as a label.
+  bool acceptsIdentifier() const {
+    return kind == OperandSymbolKind::Register || !previous;
+  }
+
+  /// A fresh operand can be completed after separators or a direct branch mnemonic.
+  std::optional<SymbolCompletion> emptyOperandAt(SourcePos cursor) const {
+    if ((kind == OperandSymbolKind::BranchLabel && !previous) ||
+        (kind == OperandSymbolKind::Register &&
+         (previous == TokenKind::Comma || previous == TokenKind::LBracket ||
+          previous == TokenKind::LBrace || previous == TokenKind::LParen))) {
+      return SymbolCompletion{kind, instruction, {}, {cursor, cursor}};
+    }
+    return std::nullopt;
+  }
+};
+
 /// Tracks statement boundaries and distinguishes blocks from operand braces.
 struct CompletionContext {
   BodyPosition body = BodyPosition::Start;
@@ -42,6 +66,7 @@ struct CompletionContext {
   bool function_header = false;
   bool header_pragma = false;
   std::int32_t directive_line = 0;
+  std::optional<OperandContext> operands;
 
   /// A statement head can also be a label or a predicate guard.
   bool atStatementStart() const {
@@ -70,6 +95,14 @@ struct CompletionContext {
 
   /// Updates the lexical context after a token wholly before the cursor.
   void consume(TokenKind kind, std::int32_t line, bool label) {
+    if (operands) {
+      if (other_braces == 0 &&
+          (kind == TokenKind::Semicolon || kind == TokenKind::RBrace)) {
+        operands.reset();
+      } else {
+        operands->previous = kind;
+      }
+    }
     if (other_braces != 0) {
       if (kind == TokenKind::LBrace) {
         ++other_braces;
@@ -328,6 +361,32 @@ std::optional<InstructionCompletion> instructionCompletionAt(
               readModifierCompletion(lexer, token.text, cursor_line, cursor)) {
         return std::move(*modifier);
       }
+      if (std::ranges::binary_search(instructionOpcodes(), token.text)) {
+        context.operands = OperandContext{
+            token.range.start, token.text == "bra" ? OperandSymbolKind::BranchLabel
+                                                   : OperandSymbolKind::Register,
+            std::nullopt};
+        context.body = BodyPosition::Statement;
+        continue;
+      }
+    }
+    if (const auto& operands = context.operands) {
+      // A lone '%' has its own lexer kind until the register name arrives.
+      const bool register_prefix = token.kind == TokenKind::Percent &&
+                                   operands->kind == OperandSymbolKind::Register;
+      const bool operand_name = identifier || register_prefix;
+      if (operand_name && operands->acceptsIdentifier() &&
+          !before(token.range.end, cursor) && lexer.peek().kind != TokenKind::Colon) {
+        const auto length = static_cast<std::size_t>(
+            cursor.column - token.range.start.column);
+        return SymbolCompletion{operands->kind, operands->instruction,
+                                token.text.substr(0, length), token.range};
+      }
+      if (token.kind == TokenKind::Semicolon && token.range.start == cursor) {
+        if (auto empty = operands->emptyOperandAt(cursor)) {
+          return std::move(*empty);
+        }
+      }
     }
     const bool predicate = identifier && context.expectsPredicate();
     const bool unterminated_comment =
@@ -342,6 +401,11 @@ std::optional<InstructionCompletion> instructionCompletionAt(
   context.advanceTo(cursor.line);
   if (context.expectsOpcode()) {
     return MnemonicCompletion{{}, {cursor, cursor}};
+  }
+  if (context.operands) {
+    if (auto empty = context.operands->emptyOperandAt(cursor)) {
+      return std::move(*empty);
+    }
   }
   return std::nullopt;
 }

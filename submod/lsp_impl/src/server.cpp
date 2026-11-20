@@ -44,7 +44,7 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
                         .change = lsp::TextDocumentSyncKind::Full,
                     },
                     .completionProvider = lsp::CompletionOptions{
-                        .triggerCharacters = lsp::Array<lsp::String>{"."},
+                        .triggerCharacters = lsp::Array<lsp::String>{".", "%"},
                     },
                     .hoverProvider = true,
                     .definitionProvider = true,
