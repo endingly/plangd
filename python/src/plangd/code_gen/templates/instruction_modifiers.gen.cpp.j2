@@ -4,11 +4,26 @@
 #include <algorithm>
 #include <array>
 
+#include <ptx_frontend/resolved_ir/ptx_resolved_ir_foundation.hpp>
+
 namespace plangd {
 namespace {
 
+namespace base = ptx_frontend::base;
+namespace checker = ptx_frontend::resolved_ir::checker;
+
+constexpr checker::AvailabilityDescriptor kAvailability[] = {
+{% for requirement in data.requirements %}
+    {{ requirement }},
+{% endfor %}
+};
+
 {% for slot in data.slots %}
-constexpr std::string_view kSpellings{{ loop.index0 }}[] = { {{- slot.spellings | map('cpp_string') | join(', ') -}} };
+constexpr ModifierSpelling kSpellings{{ loop.index0 }}[] = {
+{% for spelling, availability in slot.spellings %}
+    { {{- spelling | cpp_string }}, {{ availability }}},
+{% endfor %}
+};
 {% endfor %}
 
 constexpr std::array<ModifierSlot, {{ data.slots | length }}> kSlots = {
@@ -18,9 +33,9 @@ constexpr std::array<ModifierSlot, {{ data.slots | length }}> kSlots = {
 };
 
 {% if data.orders_by_opcode %}
-constexpr ModifierSlotId kOrderSlots[] = {
+constexpr std::array<ModifierSlotId, {{ data.order_slot_count }}> kOrderSlots = {
 {% for orders in data.orders_by_opcode.values() %}
-{% for order in orders %}
+{% for order, availability in orders if order %}
     {{ order | join(', ') }},
 {% endfor %}
 {% endfor %}
@@ -29,8 +44,12 @@ constexpr ModifierSlotId kOrderSlots[] = {
 {% set offsets = namespace(slot=0, order=0) %}
 constexpr ModifierOrder kOrders[] = {
 {% for orders in data.orders_by_opcode.values() %}
-{% for order in orders %}
-    {kOrderSlots + {{ offsets.slot }}, {{ order | length }}},
+{% for order, availability in orders %}
+{% if order %}
+    {std::span{kOrderSlots}.subspan({{ offsets.slot }}, {{ order | length }}), {{ availability }}},
+{% else %}
+    {{ '{' }}{}, {{ availability }}},
+{% endif %}
 {% set offsets.slot = offsets.slot + (order | length) %}
 {% endfor %}
 {% endfor %}
@@ -50,6 +69,11 @@ constexpr std::array<InstructionModifiers, {{ data.orders_by_opcode | length }}>
 };
 
 }  // namespace
+
+std::span<const ptx_frontend::resolved_ir::checker::AvailabilityDescriptor>
+instructionAvailability() noexcept {
+  return kAvailability;
+}
 
 std::span<const ModifierSlot> modifierSlots() noexcept {
   return kSlots;

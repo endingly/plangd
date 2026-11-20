@@ -19,6 +19,7 @@
 #include <ptx_frontend/syntax/ptx_syntax_lower.hpp>
 
 #include "completion.hpp"
+#include "completion_target.hpp"
 #include "instruction_docs.hpp"
 
 namespace plangd {
@@ -36,6 +37,7 @@ struct Document {
   lsp::Int version;
   std::vector<SourceLine> lines{};
   std::vector<InstructionOccurrence> instructions{};
+  std::vector<CompletionTargetRegion> completion_targets{};
   // Retain the CST until the first navigation request builds the symbol table.
   std::optional<ptx_frontend::syntax_cst::CstFile> cst{};
   std::optional<ptx_frontend::binding::SymbolTable> symbols{};
@@ -132,6 +134,7 @@ void publishDiagnostics(lsp::ServerEndpoint& endpoint,
   auto result = ptx_frontend::PtxCstParser(document.text).parseModule();
   if (result) {
     document.instructions = indexInstructions(*result);
+    document.completion_targets = indexCompletionTargets(*result);
   }
   document.cst = std::move(result.value);
   lsp::PublishDiagnosticsParams params{
@@ -309,8 +312,9 @@ lsp::TextDocumentCompletionResult completeInstruction(const Document& document,
   }
 
   lsp::Array<lsp::CompletionItem> items;
+  const auto* target = completionTargetAt(document.completion_targets, *source);
   if (const auto* modifier = std::get_if<ModifierCompletion>(&*context)) {
-    for (const auto& candidate : modifierCandidates(*modifier, line)) {
+    for (const auto& candidate : modifierCandidates(*modifier, line, target)) {
       items.push_back(completionItem(candidate.spelling,
                                      toLspRange(document, candidate.range)));
     }
@@ -323,6 +327,9 @@ lsp::TextDocumentCompletionResult completeInstruction(const Document& document,
   const std::string_view prefix = mnemonic.prefix;
   for (auto it = std::ranges::lower_bound(opcodes, prefix);
        it != opcodes.end() && it->starts_with(prefix); ++it) {
+    if (!mnemonicAvailable(*it, target)) {
+      continue;
+    }
     auto item = completionItem(*it, range);
     const auto forms = findInstructionDocs(*it);
     if (!forms.empty()) {

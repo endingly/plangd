@@ -5,16 +5,36 @@
 #include <span>
 #include <string_view>
 
+namespace ptx_frontend::resolved_ir::checker {
+struct AvailabilityDescriptor;
+}
+
 namespace plangd {
+
+using AvailabilityId = std::uint16_t;
+using ModifierSlotId = std::uint16_t;
+
+/// Source spelling and its target requirement within one modifier slot.
+struct ModifierSpelling {
+  std::string_view text;
+  AvailabilityId availability;
+};
 
 /// Accepted spellings of one modifier slot and whether that slot may be skipped.
 struct ModifierSlot {
-  std::span<const std::string_view> spellings;
+  std::span<const ModifierSpelling> spellings;
   bool optional;
 };
 
-using ModifierSlotId = std::uint16_t;
-using ModifierOrder = std::span<const ModifierSlotId>;
+/// One ordered variant and its target requirement. The slot list may be empty.
+struct ModifierOrder {
+  std::span<const ModifierSlotId> slots;
+  AvailabilityId availability;
+};
+
+/// Borrows the generated conditions indexed by variant and spelling requirements.
+std::span<const ptx_frontend::resolved_ir::checker::AvailabilityDescriptor>
+instructionAvailability() noexcept;
 
 /// Borrows the shared slot table indexed by the entries in each modifier order.
 std::span<const ModifierSlot> modifierSlots() noexcept;

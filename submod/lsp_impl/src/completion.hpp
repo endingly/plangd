@@ -8,6 +8,10 @@
 
 #include <ptx_frontend/common/source_loc.hpp>
 
+namespace ptx_frontend::resolved_ir::checker {
+struct TargetInfo;
+}
+
 namespace plangd {
 
 /// An opcode prefix and the full single-line mnemonic range it can replace.
@@ -43,8 +47,13 @@ std::optional<InstructionCompletion> instructionCompletionAt(
     std::string_view text, std::string_view cursor_line,
     ptx_frontend::SourcePos cursor);
 
-/// Returns the sorted, distinct next spellings accepted by the modifier orders.
-std::vector<ModifierCandidate> modifierCandidates(const ModifierCompletion& context,
-                                                  std::string_view cursor_line);
+/// Reports if any form of an opcode is available for the active known target.
+bool mnemonicAvailable(
+    std::string_view opcode, const ptx_frontend::resolved_ir::checker::TargetInfo* target);
+
+/// Returns the sorted next spellings accepted by the available modifier orders.
+std::vector<ModifierCandidate> modifierCandidates(
+    const ModifierCompletion& context, std::string_view cursor_line,
+    const ptx_frontend::resolved_ir::checker::TargetInfo* target);
 
 }  // namespace plangd

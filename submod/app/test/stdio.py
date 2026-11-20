@@ -310,7 +310,14 @@ def check_instruction_completion(executable, initialize, shutdown):
     """Check completion and source edits on successive unfinished snapshots."""
     uri = "file:///tmp/plangd-completion.ptx"
     header = ".version 8.0\r\n.target sm_90\r\n.address_size 64\r\n"
-    body = header + ".visible .entry example() {\r\n"
+    kernel = ".visible .entry example() {\r\n"
+    body = header + kernel
+
+    def configured(version, target):
+        return f".version {version}\r\n.target {target}\r\n.address_size 64\r\n" + kernel
+
+    modern = configured("9.3", "sm_100a")
+    region = ".version 8.2\r\n.target sm_80\r\n.entry first() { ret; }\r\n"
     cases = [
         (body + "  mo|", "mov", "mo"),
         (body + "  /* 中文🚀 */ loop: @!%p1 mo|xxx.u32 %r1, 0;", "mov", "moxxx"),
@@ -339,14 +346,14 @@ def check_instruction_completion(executable, initialize, shutdown):
         (body + "  ld.global.|", ".u32", "."),
         (body + "  ld.global.v2.u| %r1, [%rd1];", ".u32", ".u"),
         (body + "  ld .global\r\n  .u|", ".u32", ".u"),
-        (body + "  ld.param::|", ".param::entry", ".param::"),
-        (body + "  ld.param::en|try.u32", ".param::entry", ".param::entry"),
+        (modern + "  ld.param::|", ".param::entry", ".param::"),
+        (modern + "  ld.param::en|try.u32", ".param::entry", ".param::entry"),
         (body + "  min.xorsign.a|.f32", ".xorsign.abs", ".xorsign.a"),
         (body + "  min.xor|sign.a.f32", ".xorsign.abs", ".xorsign.a"),
         (body + "  min.xor|sign.abs.f32", ".xorsign.abs", ".xorsign.abs"),
         (body + "  fence.cta.acq_|", ".acq_rel", ".acq_"),
         (body + "  fence.acq_rel.c|", ".cta", ".c"),
-        (body + "  add.f32.f16.sa|", ".sat", ".sa"),
+        (modern + "  add.f32.f16.sa|", ".sat", ".sa"),
         (body + "  ld.global.shared.u|", None, ".u"),
         (body + "  ld.global.unsup|", None, ".unsup"),
         (body + "  unknown_opcode.glo|", None, ".glo"),
@@ -354,6 +361,27 @@ def check_instruction_completion(executable, initialize, shutdown):
         (body + "  ld /* .glo| */ .global.u32", None, None),
         (body + "  .reg .u|32 %r1;", None, None),
         (header + ".target sm_90, .glo|", None, None),
+        (configured("8.1", "sm_80") + "  ld.mm|", None, ".mm"),
+        (configured("8.2", "sm_61") + "  ld.mm|", None, ".mm"),
+        (configured("8.2", "sm_80") + "  ld.mm|", ".mmio", ".mm"),
+        (configured("8.1", "sm_80") + "  ld.mmio.rel|", None, ".rel"),
+        (configured("8.2", "sm_80") + "  ld.mmio.rel|", ".relaxed", ".rel"),
+        (configured("8.0", "sm_75") + "  min.Na|", None, ".Na"),
+        (configured("8.0", "sm_80") + "  min.Na|", ".NaN", ".Na"),
+        (configured("8.0", "sm_80") + "  ld.shared::cl|", None, ".shared::cl"),
+        (body + "  ld.shared::cl|", ".shared::cluster", ".shared::cl"),
+        (body + "  setmaxnr|", None, "setmaxnr"),
+        (configured("8.0", "sm_90a") + "  setmaxnr|", "setmaxnreg", "setmaxnr"),
+        (body + "  setmaxnreg.i|", None, ".i"),
+        (configured("8.0", "sm_90a") + "  setmaxnreg.i|", ".inc", ".i"),
+        (configured("8.8", "sm_100f") + "  setmaxnreg.i|", ".inc", ".i"),
+        (configured("8.8", "sm_100") + "  setmaxnreg.i|", None, ".i"),
+        (region + ".target sm_61\r\n" + kernel + "  ld.mm|", None, ".mm"),
+        (region.replace("ret;", "ld.mm|") + ".target sm_61\r\n", ".mmio", ".mm"),
+        (region.replace("8.2", "8.1") + ".target\r\n" + kernel + "  ld.mm|", ".mmio", ".mm"),
+        (region.replace("8.2", "8.1") + ".target sm_999\r\n" + kernel + "  ld.mm|", ".mmio", ".mm"),
+        (".version 8.1\r\n" + kernel + "  ld.mm|", ".mmio", ".mm"),
+        (".target sm_61\r\n" + kernel + "  ld.mm|", ".mmio", ".mm"),
     ]
     excluded = {body + "  ld.global.|": {".global", ".shared"}}
 

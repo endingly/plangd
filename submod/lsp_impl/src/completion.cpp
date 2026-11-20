@@ -9,11 +9,14 @@
 #include <utility>
 
 #include <ptx_frontend/lexer/ptx_lexer.hpp>
+#include <ptx_frontend/resolved_ir/ptx_resolved_ir_checker_support.hpp>
 
 #include "instruction_modifiers.gen.hpp"
 
 namespace plangd {
 namespace {
+
+namespace checker = ptx_frontend::resolved_ir::checker;
 
 using ptx_frontend::PtxToken;
 using ptx_frontend::SourcePos;
@@ -200,21 +203,54 @@ std::optional<ModifierCompletion> readModifierCompletion(
   return std::nullopt;
 }
 
+/// Evaluates shared ISA requirements only when a document target is known.
+struct AvailabilityFilter {
+  const checker::TargetInfo* target;
+  std::span<const checker::AvailabilityDescriptor> requirements =
+      instructionAvailability();
+
+  /// The generator reserves condition zero for unrestricted spellings.
+  bool allows(AvailabilityId id) const {
+    return !target || id == 0 || checker::is_available(requirements[id], *target);
+  }
+
+  /// A viable order must have at least one available spelling per required slot.
+  bool allowsOrder(ModifierOrder order, std::span<const ModifierSlot> slots) const {
+    if (!allows(order.availability)) {
+      return false;
+    }
+    return !target || std::ranges::all_of(order.slots, [&](ModifierSlotId id) {
+      const auto& slot = slots[id];
+      return slot.optional || std::ranges::any_of(slot.spellings, [&](const auto& spelling) {
+        return allows(spelling.availability);
+      });
+    });
+  }
+};
+
 /// Tries one slot order, skipping only optional slots when a spelling mismatches.
 void collectModifierCandidates(ModifierOrder order,
                                std::span<const ModifierSlot> slots,
                                std::span<const WrittenModifier> preceding,
                                std::string_view prefix, SourceRange range,
+                               const AvailabilityFilter& available,
                                std::map<std::string_view, SourceRange>& candidates) {
-  for (const auto id : order) {
+  if (!available.allowsOrder(order, slots)) {
+    return;
+  }
+  for (const auto id : order.slots) {
     const auto& slot = slots[id];
     if (preceding.empty()) {
-      for (const auto spelling : slot.spellings) {
-        if (spelling.starts_with(prefix)) {
-          candidates.try_emplace(spelling, range);
+      for (const auto& spelling : slot.spellings) {
+        if (spelling.text.starts_with(prefix) &&
+            available.allows(spelling.availability)) {
+          candidates.try_emplace(spelling.text, range);
         }
       }
-    } else if (std::ranges::contains(slot.spellings, preceding.front().spelling)) {
+    } else if (std::ranges::any_of(slot.spellings, [&](const auto& spelling) {
+                 return spelling.text == preceding.front().spelling &&
+                        available.allows(spelling.availability);
+               })) {
       preceding = preceding.subspan(1);
       continue;
     }
@@ -310,17 +346,32 @@ std::optional<InstructionCompletion> instructionCompletionAt(
   return std::nullopt;
 }
 
-std::vector<ModifierCandidate> modifierCandidates(const ModifierCompletion& context,
-                                                  std::string_view cursor_line) {
+bool mnemonicAvailable(std::string_view opcode, const checker::TargetInfo* target) {
+  const auto orders = modifierOrders(opcode);
+  if (!target || orders.empty()) {
+    return true;
+  }
+  const AvailabilityFilter available{target};
+  const auto slots = modifierSlots();
+  return std::ranges::any_of(orders, [&](const auto& order) {
+    return available.allowsOrder(order, slots);
+  });
+}
+
+std::vector<ModifierCandidate> modifierCandidates(
+    const ModifierCompletion& context, std::string_view cursor_line,
+    const checker::TargetInfo* target) {
   const auto orders = modifierOrders(context.opcode);
   const auto slots = modifierSlots();
+  const AvailabilityFilter available{target};
   std::span<const WrittenModifier> preceding = context.preceding;
   auto prefix = context.prefix;
   auto range = context.range;
   std::map<std::string_view, SourceRange> candidates;
   for (;;) {
     for (const auto order : orders) {
-      collectModifierCandidates(order, slots, preceding, prefix, range, candidates);
+      collectModifierCandidates(order, slots, preceding, prefix, range, available,
+                                candidates);
     }
     if (preceding.empty() || preceding.back().range.end != range.start) {
       break;
