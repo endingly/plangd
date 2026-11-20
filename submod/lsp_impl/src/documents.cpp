@@ -5,9 +5,11 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -17,6 +19,7 @@
 #include <lsp/server_endpoint.h>
 #include <ptx_frontend/binding/ptx_symbol_table.hpp>
 #include <ptx_frontend/cst/ptx_cst_parser.hpp>
+#include <ptx_frontend/semantic/ptx_declaration_semantics.hpp>
 #include <ptx_frontend/syntax/ptx_syntax_lower.hpp>
 
 #include "completion.hpp"
@@ -30,6 +33,7 @@ namespace {
 
 namespace binding = ptx_frontend::binding;
 namespace cst = ptx_frontend::syntax_cst;
+namespace declaration = ptx_frontend::declaration_semantics;
 
 /// Byte span of one line in the document text, excluding its terminator.
 struct SourceLine {
@@ -171,11 +175,12 @@ bool recoveredBody(const std::vector<cst::CstFunctionBodyItem>& body) {
   });
 }
 
-/// Adds binding errors where the parser retained a reliable declaration context.
-void appendBindingDiagnostics(lsp::PublishDiagnosticsParams& params,
-                              const Document& document, const cst::CstFile& file,
-                              std::vector<binding::BindDiagnostic>& diagnostics,
-                              bool syntax_errors, bool related_information) {
+/// Adds semantic errors where the parser retained a reliable declaration context.
+void appendSemanticDiagnostics(lsp::PublishDiagnosticsParams& params,
+                               const Document& document, const cst::CstFile& file,
+                               const ptx_frontend::syntax_ast::AstModule& ast,
+                               const binding::SymbolBinding& bound,
+                               bool syntax_errors, bool related_information) {
   std::vector<ptx_frontend::SourceRange> recovered_functions;
   if (syntax_errors) {
     const auto* module = file.module();
@@ -191,21 +196,56 @@ void appendBindingDiagnostics(lsp::PublishDiagnosticsParams& params,
     }
   }
 
-  for (auto& error : diagnostics) {
+  const auto range_key = [](ptx_frontend::SourceRange range) {
+    return std::pair{coordinates(range.start), coordinates(range.end)};
+  };
+  using RangeKey = decltype(range_key({}));
+  const auto declarations = declaration::checkDeclarations(ast, bound.table);
+  using DeclarationKind = declaration::DeclarationDiagnosticKind;
+  std::vector<ptx_frontend::SourceRange> invalid_integers;
+  for (const auto& error : declarations) {
+    if (error.kind == DeclarationKind::InvalidIntegerLiteral) {
+      invalid_integers.push_back(error.range);
+    }
+  }
+  const auto start_key = [](auto range) { return coordinates(range.start); };
+  std::ranges::sort(invalid_integers, {}, start_key);
+
+  std::set<std::tuple<RangeKey, std::optional<RangeKey>, std::string_view>> seen;
+  const auto append = [&](const auto& error, const char* related_message) {
     if (std::ranges::any_of(recovered_functions, [&](auto range) {
           return contains(range, error.range.start);
         })) {
-      continue;
+      return;
     }
-    auto diagnostic = documentDiagnostic(document, error.range,
-                                         std::move(error.message));
+    const auto previous = error.previous_range.transform(range_key);
+    if (!seen.emplace(range_key(error.range), previous, error.message).second) {
+      return;
+    }
+    auto diagnostic = documentDiagnostic(document, error.range, error.message);
     if (related_information && error.previous_range) {
       diagnostic.relatedInformation.emplace().push_back({
           .location = {params.uri, toLspRange(document, *error.previous_range)},
-          .message = "Previous declaration is here.",
+          .message = related_message,
       });
     }
     params.diagnostics.push_back(std::move(diagnostic));
+  };
+  for (const auto& error : bound.diagnostics) {
+    append(error, "Previous declaration is here.");
+  }
+  for (const auto& error : declarations) {
+    if (error.kind == DeclarationKind::InvalidArrayDimension ||
+        error.kind == DeclarationKind::InvalidInitializerExpression) {
+      const auto literal = std::ranges::lower_bound(
+          invalid_integers, coordinates(error.range.start), {}, start_key);
+      // The literal diagnostic explains why this expression could not be evaluated.
+      if (literal != invalid_integers.end() &&
+          coordinates(literal->end) <= coordinates(error.range.end)) {
+        continue;
+      }
+    }
+    append(error, "Related source location.");
   }
 }
 
@@ -232,9 +272,9 @@ void publishDiagnostics(lsp::ServerEndpoint& endpoint,
     }
     if (ast) {
       auto bound = binding::bindSymbols(*ast);
-      if (ast.diagnostics.empty() && !bound.diagnostics.empty()) {
-        appendBindingDiagnostics(params, document, *result, bound.diagnostics,
-                                 !result.diagnostics.empty(), related_information);
+      if (ast.diagnostics.empty()) {
+        appendSemanticDiagnostics(params, document, *result, *ast, bound,
+                                  !result.diagnostics.empty(), related_information);
       }
       document.symbols = std::move(bound.table);
     }

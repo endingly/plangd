@@ -106,8 +106,8 @@ def check_document_sync(executable, initialize, shutdown):
     assert closed["diagnostics"] == [], closed
 
 
-def check_binding_diagnostics(executable, initialize, shutdown):
-    """Check source ranges, recovery and replacement of binding diagnostics."""
+def check_semantic_diagnostics(executable, initialize, shutdown):
+    """Check source ranges, recovery and replacement of semantic diagnostics."""
     uri = "file:///tmp/plangd-binding-diagnostics.ptx"
     valid = [
         ".version 8.0",
@@ -127,6 +127,10 @@ def check_binding_diagnostics(executable, initialize, shutdown):
         ".entry second() {",
         "  ret;",
         "}",
+        "/* 中文🚀 */ .global .align 4 .u32 data;",
+        ".global .u32 values[4];",
+        ".func callee(.reg .u32 value);",
+        ".func callee(.reg .u32 value) { ret; }",
     ]
 
     def edited(replacements):
@@ -146,7 +150,23 @@ def check_binding_diagnostics(executable, initialize, shutdown):
         7: valid[7].replace("0;", "%temp;"),
         15: "  bra outside_missing;",
     })
-    recovering_module = edited({3: ".extern .func ;"})
+    bad_alignment = valid[17].replace("align 4", "align 3")
+    overflow = "18446744073709551616"
+    recovering_module = edited({3: ".extern .func ;", 17: bad_alignment})
+    declaration_errors = edited({
+        5: "  .reg .u320 %r;",
+        6: "  .reg .v2 .pred %temp;",
+        7: valid[7].replace("%r", "%unknown"),
+        17: bad_alignment,
+        18: valid[18].replace("[4]", f"[{overflow}]"),
+        20: valid[20].replace(".u32", ".u64"),
+    })
+    partial_declarations = edited({
+        5: declaration_errors[5],
+        9: "  { .reg .u32 ; }",
+        15: "  .reg .v2 .pred %p;",
+        17: bad_alignment,
+    })
 
     def token_range(lines, line, spelling):
         prefix = lines[line][:lines[line].index(spelling)]
@@ -182,6 +202,9 @@ def check_binding_diagnostics(executable, initialize, shutdown):
         }},
         change(6, recovering_module),
         change(7, valid),
+        change(8, declaration_errors),
+        change(9, partial_declarations),
+        change(10, valid),
         {"method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}},
         *shutdown,
     ])
@@ -189,11 +212,12 @@ def check_binding_diagnostics(executable, initialize, shutdown):
     published = [response["params"] for response in responses
                  if response.get("method") == "textDocument/publishDiagnostics"]
     assert all(snapshot["uri"] == uri for snapshot in published), published
-    assert [snapshot.get("version") for snapshot in published] == [1, 2, 3, 4, 5, 6, 7, None]
-    opened, errors, target, fixed, partial, module, restored, closed = (
+    assert [snapshot.get("version") for snapshot in published] == [*range(1, 11), None]
+    (opened, errors, target, fixed, partial, module, restored, declarations,
+     partial_decls, cleared, closed) = (
         snapshot["diagnostics"] for snapshot in published
     )
-    assert opened == fixed == restored == closed == [], published
+    assert opened == fixed == restored == cleared == closed == [], published
     assert len(errors) == 3, errors
 
     def diagnostic_at(diagnostics, lines, line, spelling, expected_message):
@@ -220,6 +244,22 @@ def check_binding_diagnostics(executable, initialize, shutdown):
     location = next(response["result"] for response in responses if response.get("id") == 20)
     assert location == {"uri": uri, "range": token_range(valid, 5, "%r")}, location
     assert module and all(item["range"]["start"]["line"] == 3 for item in module), module
+
+    assert len(declarations) == 6, declarations
+    diagnostic_at(declarations, declaration_errors, 5, ".u320", "Unknown register declaration type")
+    diagnostic_at(declarations, declaration_errors, 6, ".v2", "Predicate register declarations")
+    diagnostic_at(declarations, declaration_errors, 7, "%unknown", "Unresolved")
+    diagnostic_at(declarations, declaration_errors, 17, "3", "power of two")
+    diagnostic_at(declarations, declaration_errors, 18, overflow, "uint64_t")
+    mismatch = diagnostic_at(declarations, declaration_errors, 20, "callee", "incompatible")
+    assert mismatch["relatedInformation"][0]["location"] == {
+        "uri": uri, "range": token_range(valid, 19, "callee"),
+    }, mismatch
+
+    assert len(partial_decls) == 3, partial_decls
+    assert any(item["range"]["start"]["line"] == 9 for item in partial_decls), partial_decls
+    diagnostic_at(partial_decls, partial_declarations, 15, ".v2", "Predicate register declarations")
+    diagnostic_at(partial_decls, partial_declarations, 17, "3", "power of two")
 
 
 def check_symbol_navigation(executable, initialize, shutdown):
@@ -987,7 +1027,7 @@ if __name__ == "__main__":
     assert responses == [], responses
 
     check_document_sync(executable, initialize, shutdown)
-    check_binding_diagnostics(executable, initialize, shutdown)
+    check_semantic_diagnostics(executable, initialize, shutdown)
     check_symbol_navigation(executable, initialize, shutdown)
     check_symbol_references(executable, initialize, shutdown)
     check_instruction_completion(executable, initialize, shutdown)

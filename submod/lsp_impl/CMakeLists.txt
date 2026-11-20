@@ -1,5 +1,7 @@
 find_package(lsp 2.0 CONFIG REQUIRED)
-find_package(ptx_frontend CONFIG REQUIRED COMPONENTS base lexer cst syntax binding resolved_ir ptx_spec)
+find_package(ptx_frontend CONFIG REQUIRED COMPONENTS
+    base lexer cst syntax binding semantic resolved_ir ptx_spec
+)
 
 set(codegen_source_dir "${PROJECT_SOURCE_DIR}/python/src")
 set(codegen_command
@@ -65,5 +67,6 @@ target_include_directories(plangd_lsp_impl
 target_link_libraries(plangd_lsp_impl
     PUBLIC lsp::lsp
     PRIVATE ptx_frontend::base ptx_frontend::lexer ptx_frontend::cst
-        ptx_frontend::syntax ptx_frontend::binding ptx_frontend::resolved_ir
+        ptx_frontend::syntax ptx_frontend::binding ptx_frontend::semantic
+        ptx_frontend::resolved_ir
 )
