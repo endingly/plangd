@@ -15,6 +15,7 @@ struct DocumentClientOptions {
   bool versioned_edits = false;
   bool diagnostic_related_information = false;
   bool hierarchical_document_symbols = false;
+  bool line_folding_only = false;
 };
 
 /// Registers the open-document handlers using the negotiated client options.

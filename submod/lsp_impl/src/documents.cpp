@@ -1,6 +1,7 @@
 #include "documents.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -24,6 +25,7 @@
 
 #include "completion.hpp"
 #include "completion_target.hpp"
+#include "document_syntax.hpp"
 #include "instruction_docs.hpp"
 #include "symbol_completion.hpp"
 #include "symbol_rename.hpp"
@@ -50,6 +52,7 @@ struct Document {
   std::vector<CompletionTargetRegion> completion_targets{};
   lsp::Array<lsp::DocumentSymbol> outline{};
   std::optional<ptx_frontend::binding::SymbolTable> symbols{};
+  DocumentSyntax syntax{};
 };
 
 /// A bound symbol and the range of the reference under the cursor.
@@ -328,14 +331,23 @@ void publishDiagnostics(lsp::ServerEndpoint& endpoint,
       }
       document.symbols = std::move(bound.table);
     }
+    document.syntax = indexDocumentSyntax(*result, document.symbols ? &*document.symbols : nullptr);
   }
   endpoint.textDocumentPublishDiagnostics(params);
 }
 
-/// Identifies the symbol kinds covered by document-local navigation.
+/// Identifies the local symbols used by hover, highlight and rename.
 bool isNavigable(const binding::Symbol& symbol) {
   return symbol.kind == binding::SymbolKind::Label ||
          symbol.state_space == ptx_frontend::base::DeclarationStateSpace::Register;
+}
+
+bool isModuleData(const binding::SymbolTable& symbols, const binding::Symbol& symbol) {
+  using StateSpace = ptx_frontend::base::DeclarationStateSpace;
+  return symbol.kind == binding::SymbolKind::Variable &&
+         symbol.scope == symbols.moduleScope() &&
+         (symbol.state_space == StateSpace::Global ||
+          symbol.state_space == StateSpace::Constant);
 }
 
 /// Borrows the bound reference covering the cursor, if one exists.
@@ -369,16 +381,20 @@ std::optional<ResolvedReference> findReference(const Document& document,
 
 /// Selects a bound reference or a declaration at the cursor.
 std::optional<SymbolSelection> symbolAt(
-    const binding::SymbolTable& symbols, ptx_frontend::SourcePos source) {
+    const binding::SymbolTable& symbols, ptx_frontend::SourcePos source,
+    bool include_module_data = false) {
+  const auto supported = [&](const binding::Symbol& symbol) {
+    return isNavigable(symbol) || (include_module_data && isModuleData(symbols, symbol));
+  };
   if (const auto* reference = referenceAt(symbols, source)) {
     const auto target = *reference->target;
-    if (isNavigable(symbols.symbol(target.symbol))) {
+    if (supported(symbols.symbol(target.symbol))) {
       return SymbolSelection{target, reference->range};
     }
     return std::nullopt;
   }
   for (const auto& symbol : symbols.symbols()) {
-    if (!isNavigable(symbol)) {
+    if (!supported(symbol)) {
       continue;
     }
     // Selecting a group declaration covers all of its numbered members.
@@ -436,7 +452,7 @@ lsp::TextDocumentReferencesResult findReferences(
   if (!symbols) {
     return nullptr;
   }
-  const auto target = symbolAt(*symbols, *source);
+  const auto target = symbolAt(*symbols, *source, true);
   if (!target) {
     return nullptr;
   }
@@ -448,6 +464,26 @@ lsp::TextDocumentReferencesResult findReferences(
     locations.push_back({.uri = uri, .range = toLspRange(document, range)});
   }
   return locations;
+}
+
+/// Highlights the occurrences of the selected local register, group member or label.
+lsp::TextDocumentDocumentHighlightResult highlightSymbol(
+    const Document& document, lsp::Position position) {
+  const auto source = toSourcePosition(document, position);
+  if (!source || !document.symbols) {
+    return nullptr;
+  }
+  const auto target = symbolAt(*document.symbols, *source);
+  if (!target) {
+    return nullptr;
+  }
+  const auto ranges = symbolOccurrences(*document.symbols, target->lookup, true);
+  lsp::Array<lsp::DocumentHighlight> highlights;
+  highlights.reserve(ranges.size());
+  for (const auto& range : ranges) {
+    highlights.push_back({.range = toLspRange(document, range)});
+  }
+  return highlights;
 }
 
 /// A selected local register, register group, or label in the current snapshot.
@@ -553,21 +589,115 @@ lsp::TextDocumentRenameResult renameSymbol(const Document& document,
   return result;
 }
 
-/// Returns the declaration location of the reference under the cursor.
+/// Resolves local references and prefers a device function's body when present.
 lsp::TextDocumentDefinitionResult findDefinition(const Document& document,
                                                  const lsp::DocumentUri& uri,
                                                  lsp::Position position) {
   const auto source = toSourcePosition(document, position);
-  if (!source) {
+  if (!source || !document.symbols) {
     return nullptr;
   }
-  const auto reference = findReference(document, *source);
+  const auto* reference = referenceAt(*document.symbols, *source);
   if (!reference) {
     return nullptr;
   }
-  return lsp::Definition{lsp::Location{
-      .uri = uri,
-      .range = toLspRange(document, reference->symbol.declaration_range)}};
+  const auto& symbol = document.symbols->symbol(reference->target->symbol);
+  auto range = symbol.declaration_range;
+  const auto* function = reference->kind == binding::ReferenceKind::CallTarget
+                             ? deviceFunctionTarget(*document.symbols, symbol) : nullptr;
+  if (function) {
+    range = function->declaration_range;
+    if (const auto declaration = document.syntax.functions.find(function->id.value);
+        declaration != document.syntax.functions.end()) {
+      range = declaration->second.name_range;
+    }
+  } else if (!isNavigable(symbol) && !isModuleData(*document.symbols, symbol)) {
+    return nullptr;
+  }
+  return lsp::Definition{lsp::Location{.uri = uri, .range = toLspRange(document, range)}};
+}
+
+/// Converts brace spans to folding ranges for the client's supported granularity.
+lsp::Array<lsp::FoldingRange> foldingRanges(const Document& document, bool line_only) {
+  lsp::Array<lsp::FoldingRange> folds;
+  for (const auto& source : document.syntax.folds) {
+    const auto range = toLspRange(document, source);
+    if (line_only) {
+      // Keep the closing brace visible and retain the outermost fold on a shared line.
+      if (range.end.line > range.start.line + 1 &&
+          (folds.empty() || folds.back().startLine != range.start.line)) {
+        folds.push_back({.startLine = range.start.line, .endLine = range.end.line - 1});
+      }
+    } else {
+      folds.push_back({.startLine = range.start.line,
+                       .endLine = range.end.line,
+                       .startCharacter = range.start.character,
+                       .endCharacter = range.end.character});
+    }
+  }
+  return folds;
+}
+
+/// Delta-encodes ordered UTF-16 ranges according to the advertised token legend.
+lsp::SemanticTokens semanticTokens(const Document& document) {
+  lsp::SemanticTokens result;
+  lsp::Position previous{};
+  lsp::Uint previous_end = 0;
+  for (const auto& token : document.syntax.tokens) {
+    const auto range = toLspRange(document, token.range);
+    const auto line = range.start.line;
+    const auto column = range.start.character;
+    if (line != range.end.line || column >= range.end.character ||
+        (line == previous.line && column < previous_end)) {
+      continue;
+    }
+    const auto delta_line = line - previous.line;
+    const auto delta_start = delta_line == 0 ? column - previous.character : column;
+    result.data.append_range(std::array{
+        delta_line, delta_start, range.end.character - column,
+        static_cast<lsp::Uint>(token.kind), lsp::Uint{0}});
+    previous = range.start;
+    previous_end = range.end.character;
+  }
+  return result;
+}
+
+/// Maps a call-list cursor to a formal parameter in the single displayed signature.
+lsp::TextDocumentSignatureHelpResult signatureHelp(const Document& document,
+                                                  lsp::Position position) {
+  const auto source = toSourcePosition(document, position);
+  if (!source) {
+    return nullptr;
+  }
+  const auto cursor = coordinates(*source);
+  const auto call = std::ranges::find_if(document.syntax.calls, [&](const auto& item) {
+    return contains(item.range, *source) || item.range.end == *source;
+  });
+  if (call == document.syntax.calls.end()) {
+    return nullptr;
+  }
+  const auto declaration = document.syntax.functions.find(call->callee.value);
+  if (declaration == document.syntax.functions.end()) {
+    return nullptr;
+  }
+  const auto& function = declaration->second;
+  lsp::SignatureHelp help{.signatures = {function.signature}, .activeSignature = 0};
+  const auto select = [&](const std::optional<CallArguments>& arguments,
+                          lsp::Uint offset, std::size_t limit) {
+    if (!arguments || cursor < coordinates(arguments->contents.start) ||
+        coordinates(arguments->contents.end) < cursor) {
+      return;
+    }
+    const auto comma = std::ranges::upper_bound(arguments->comma_ends, cursor, {}, coordinates);
+    const auto index = offset + static_cast<lsp::Uint>(comma - arguments->comma_ends.begin());
+    if (index < limit) {
+      help.activeParameter = index;
+      help.signatures.front().activeParameter = index;
+    }
+  };
+  select(call->returns, 0, function.return_count);
+  select(call->inputs, function.return_count, function.signature.parameters->size());
+  return help;
 }
 
 /// Formats the bound label or register declaration for display.
@@ -820,6 +950,46 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
         }
         return findReferences(entry->second, entry->first, params.position,
                               params.context.includeDeclaration);
+      });
+
+  endpoint.onTextDocumentDocumentHighlight(
+      [documents](lsp::DocumentHighlightParams&& params)
+          -> lsp::TextDocumentDocumentHighlightResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return highlightSymbol(entry->second, params.position);
+      });
+
+  endpoint.onTextDocumentFoldingRange(
+      [documents, options](lsp::FoldingRangeParams&& params)
+          -> lsp::TextDocumentFoldingRangeResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return foldingRanges(entry->second, options->line_folding_only);
+      });
+
+  endpoint.onTextDocumentSemanticTokensFull(
+      [documents](lsp::SemanticTokensParams&& params)
+          -> lsp::TextDocumentSemanticTokensFullResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return semanticTokens(entry->second);
+      });
+
+  endpoint.onTextDocumentSignatureHelp(
+      [documents](lsp::SignatureHelpParams&& params)
+          -> lsp::TextDocumentSignatureHelpResult {
+        const auto entry = documents->find(params.textDocument.uri);
+        if (entry == documents->end()) {
+          return nullptr;
+        }
+        return signatureHelp(entry->second, params.position);
       });
 
   endpoint.onTextDocumentPrepareRename(

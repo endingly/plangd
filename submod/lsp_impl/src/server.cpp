@@ -5,6 +5,7 @@
 
 #include <lsp/server_endpoint.h>
 
+#include "document_syntax.hpp"
 #include "documents.hpp"
 
 namespace plangd {
@@ -46,6 +47,8 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
         options->hierarchical_document_symbols =
             document && document->documentSymbol &&
             document->documentSymbol->hierarchicalDocumentSymbolSupport.value_or(false);
+        options->line_folding_only = document && document->foldingRange &&
+                                     document->foldingRange->lineFoldingOnly.value_or(false);
         lsp::OneOf<lsp::Bool, lsp::RenameOptions> rename = true;
         if (document && document->rename && document->rename->prepareSupport.value_or(false)) {
           rename = lsp::RenameOptions{.prepareProvider = true};
@@ -62,10 +65,21 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
                         .triggerCharacters = lsp::Array<lsp::String>{".", "%"},
                     },
                     .hoverProvider = true,
+                    .signatureHelpProvider = lsp::SignatureHelpOptions{
+                        .triggerCharacters = lsp::Array<lsp::String>{"(", ","},
+                    },
                     .definitionProvider = true,
                     .referencesProvider = true,
+                    .documentHighlightProvider = true,
                     .documentSymbolProvider = true,
                     .renameProvider = std::move(rename),
+                    .foldingRangeProvider = true,
+                    .semanticTokensProvider = lsp::SemanticTokensOptions{
+                        .legend = {.tokenTypes = lsp::Array<lsp::String>(
+                                       semantic_token_types.begin(), semantic_token_types.end()),
+                                   .tokenModifiers = {}},
+                        .full = true,
+                    },
                 },
             .serverInfo = lsp::ServerInfo{.name = "plangd", .version = version},
         };

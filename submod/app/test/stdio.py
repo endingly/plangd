@@ -370,6 +370,193 @@ def check_document_outline(executable, initialize, shutdown):
     ], result
 
 
+def check_editor_features(executable, initialize, shutdown):
+    """Exercise navigation, folding, semantic tokens and call help on one PTX buffer."""
+    uri = "file:///tmp/plangd-editor-features.ptx"
+    lines = [
+        ".version 8.0",
+        ".target sm_90",
+        ".address_size 64",
+        ".global .u32 count;",
+        ".const .u32 bias = 7;",
+        ".func helper(.reg .u32 arg);",
+        ".extern .func remote();",
+        ".func (.reg .u32 result) combine(.reg .u32 lhs, .reg .u32 rhs) {",
+        "  add.u32 result, lhs, rhs;",
+        "  ret;",
+        "}",
+        ".func helper(.reg .u32 value) {",
+        "  ret;",
+        "}",
+        "/* 中文🚀 */ .entry kernel() {",
+        "  .reg .u32 %r<3>;",
+        "  .reg .pred %p;",
+        "  .reg .u64 %ptr;",
+        "  /* 中文🚀 */ ld.global.u32 %r0, [count];",
+        "  ld.const.u32 %r1, [bias];",
+        "  st.global.u32 [count], %r0;",
+        "  mov.u32 %r2, %tid.x;",
+        "  @%p bra done;",
+        "  {",
+        "    .reg .u32 %r0;",
+        "    mov.u32 %r0, 2;",
+        "  }",
+        "  call.uni helper, (%r0);",
+        "  call remote;",
+        "  call %ptr;",
+        "  /* 中文🚀 */ call (%r2), combine, (%r0, %r1);",
+        "done:",
+        "  ret;",
+        "}",
+        ".alias alias_helper, helper;",
+        ".entry aliased() { call alias_helper, (1); ret; }",
+    ]
+
+    def span(line, spelling):
+        index = lines[line].index(spelling)
+        column = len(lines[line][:index].encode("utf-16-le")) // 2
+        return {
+            "start": {"line": line, "character": column},
+            "end": {"line": line, "character": column + len(spelling)},
+        }
+
+    def location(line, spelling):
+        return {"uri": uri, "range": span(line, spelling)}
+
+    def request(request_id, method, line=None, spelling=None, **params):
+        if line is not None:
+            params["position"] = span(line, spelling)["start"]
+        return {"id": request_id, "method": f"textDocument/{method}", "params": {
+            "textDocument": {"uri": uri}, **params,
+        }}
+
+    opened = {"method": "textDocument/didOpen", "params": {"textDocument": {
+        "uri": uri, "languageId": "ptx", "version": 1, "text": "\r\n".join(lines),
+    }}}
+    partial = lines[30][:lines[30].index(" %r1")]
+    edited = {"method": "textDocument/didChange", "params": {
+        "textDocument": {"uri": uri, "version": 2},
+        "contentChanges": [{"text": "\r\n".join([*lines[:30], partial])}],
+    }}
+    partial_signature = request(36, "signatureHelp")
+    partial_signature["params"]["position"] = {
+        "line": 30, "character": len(partial.encode("utf-16-le")) // 2,
+    }
+    process, responses = exchange(executable, [
+        *initialize, opened,
+        request(10, "definition", 27, "helper"),
+        request(11, "definition", 28, "remote"),
+        request(12, "definition", 18, "count"),
+        request(13, "definition", 19, "bias"),
+        request(14, "references", 20, "count", context={"includeDeclaration": True}),
+        request(15, "references", 4, "bias", context={"includeDeclaration": False}),
+        request(16, "prepareRename", 18, "count"),
+        request(17, "documentHighlight", 18, "%r0"),
+        request(18, "documentHighlight", 25, "%r0"),
+        request(19, "documentHighlight", 22, "done"),
+        request(20, "foldingRange"),
+        request(21, "semanticTokens/full"),
+        request(30, "signatureHelp", 30, "%r2"),
+        request(31, "signatureHelp", 30, "%r0"),
+        request(32, "signatureHelp", 30, "%r1"),
+        request(33, "signatureHelp", 29, "%ptr"),
+        request(34, "signatureHelp", 27, "%r0"),
+        request(35, "signatureHelp", 28, "remote"),
+        request(39, "definition", 35, "alias_helper"),
+        request(40, "signatureHelp", 35, "1"),
+        edited, partial_signature, request(37, "foldingRange"),
+        {"method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}},
+        request(38, "semanticTokens/full"), *shutdown,
+    ])
+    assert process.returncode == 0, process.stderr
+    results = {item["id"]: item for item in responses if "id" in item}
+
+    def highlights(*sites):
+        return [{"range": span(line, word)} for line, word in sites]
+
+    for request_id, expected in {
+        10: location(11, "helper"),
+        11: location(6, "remote"),
+        12: location(3, "count"),
+        13: location(4, "bias"),
+        14: [location(3, "count"), location(18, "count"), location(20, "count")],
+        15: [location(19, "bias")],
+        16: None,
+        17: highlights((15, "%r"), (18, "%r0"), (20, "%r0"), (27, "%r0"), (30, "%r0")),
+        18: highlights((24, "%r0"), (25, "%r0")),
+        19: highlights((22, "done"), (31, "done")),
+        33: None,
+        38: None,
+        39: location(11, "helper"),
+    }.items():
+        assert results[request_id].get("result", ...) == expected, results[request_id]
+
+    def fold(start, end):
+        return {
+            "startLine": start, "endLine": end,
+            "startCharacter": span(start, "{")["end"]["character"],
+            "endCharacter": span(end, "}")["start"]["character"],
+        }
+
+    assert results[20]["result"] == [fold(7, 10), fold(11, 13), fold(14, 33), fold(23, 26)]
+    assert results[37]["result"] == [fold(7, 10), fold(11, 13), fold(23, 26)]
+
+    legend = results[1]["result"]["capabilities"]["semanticTokensProvider"]["legend"]
+    data = results[21]["result"]["data"]
+    tokens = {}
+    line = column = previous_end = 0
+    for delta_line, delta_start, length, kind, modifiers in zip(*[iter(data)] * 5, strict=True):
+        line += delta_line
+        column = delta_start if delta_line else column + delta_start
+        assert length > 0 and (delta_line or column >= previous_end) and modifiers == 0
+        tokens[line, column, length] = legend["tokenTypes"][kind]
+        previous_end = column + length
+    for line, spelling, kind in [
+        (3, "count", "variable"), (4, "bias", "variable"),
+        (5, "helper", "function"), (11, "helper", "function"),
+        (14, "kernel", "function"), (15, "%r", "register"),
+        (18, "ld", "keyword"), (18, ".global", "modifier"), (18, ".u32", "modifier"),
+        (18, "%r0", "register"), (18, "count", "variable"),
+        (19, "bias", "variable"), (21, "%tid", "register"),
+        (22, "done", "label"), (27, "helper", "function"), (31, "done", "label"),
+    ]:
+        column = span(line, spelling)["start"]["character"]
+        assert tokens.get((line, column, len(spelling))) == kind, (line, spelling, tokens)
+
+    combine = (".func (.reg .u32 result) combine(.reg .u32 lhs, .reg .u32 rhs)",
+               [".reg .u32 result", ".reg .u32 lhs", ".reg .u32 rhs"])
+    for request_id, (signature, parameters), active in [
+        (30, combine, 0), (31, combine, 1), (32, combine, 2),
+        (34, (".func helper(.reg .u32 value)", [".reg .u32 value"]), 0),
+        (35, (".func remote()", []), None),
+        (36, combine, 2),
+        (40, (".func helper(.reg .u32 value)", [".reg .u32 value"]), 0),
+    ]:
+        help_result = results[request_id].get("result")
+        assert help_result, results[request_id]
+        info = help_result["signatures"][0]
+        assert info["label"] == signature, info
+        assert [parameter["label"] for parameter in info["parameters"]] == parameters, info
+        assert help_result["activeSignature"] == 0 and help_result.get("activeParameter") == active
+
+    folding_init = [{
+        **initialize[0], "params": {
+            **initialize[0]["params"], "capabilities": {
+                "textDocument": {"foldingRange": {"lineFoldingOnly": True}},
+            },
+        },
+    }, *initialize[1:]]
+    process, responses = exchange(executable, [
+        *folding_init, opened, request(20, "foldingRange"), *shutdown,
+    ])
+    assert process.returncode == 0, process.stderr
+    line_folds = next(item for item in responses if item.get("id") == 20)
+    assert line_folds["result"] == [
+        {"startLine": 7, "endLine": 9}, {"startLine": 11, "endLine": 12},
+        {"startLine": 14, "endLine": 32}, {"startLine": 23, "endLine": 25},
+    ]
+
+
 def check_symbol_navigation(executable, initialize, shutdown):
     """Check symbol navigation and instruction hover across document versions."""
     uri = "file:///tmp/plangd-definition.ptx"
@@ -1118,7 +1305,11 @@ if __name__ == "__main__":
     assert capabilities["positionEncoding"] == "utf-16", capabilities
     assert capabilities["definitionProvider"] is True, capabilities
     assert capabilities["referencesProvider"] is True, capabilities
+    assert capabilities["documentHighlightProvider"] is True, capabilities
     assert capabilities["documentSymbolProvider"] is True, capabilities
+    assert capabilities["foldingRangeProvider"] is True, capabilities
+    assert capabilities["semanticTokensProvider"]["full"] is True, capabilities
+    assert capabilities["signatureHelpProvider"]["triggerCharacters"] == ["(", ","], capabilities
     assert capabilities["renameProvider"] is True, capabilities
     assert capabilities["hoverProvider"] is True, capabilities
     assert capabilities["completionProvider"]["triggerCharacters"] == [".", "%"], capabilities
@@ -1138,6 +1329,7 @@ if __name__ == "__main__":
     check_document_sync(executable, initialize, shutdown)
     check_semantic_diagnostics(executable, initialize, shutdown)
     check_document_outline(executable, initialize, shutdown)
+    check_editor_features(executable, initialize, shutdown)
     check_symbol_navigation(executable, initialize, shutdown)
     check_symbol_references(executable, initialize, shutdown)
     check_instruction_completion(executable, initialize, shutdown)

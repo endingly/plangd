@@ -50,6 +50,7 @@ add_custom_command(
 add_library(plangd_lsp_impl STATIC
     src/completion.cpp
     src/completion_target.cpp
+    src/document_syntax.cpp
     src/documents.cpp
     src/instruction_docs.cpp
     src/server.cpp
