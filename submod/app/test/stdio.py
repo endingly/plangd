@@ -37,7 +37,7 @@ def check_document_sync(executable, initialize, shutdown):
             ".version 8.0",
             ".target sm_90",
             ".address_size 64",
-            ".visible .entry demo() {",
+            ".visible .entry demo() { .reg .u32 %r1;",
             prefix + ";",
             "  ret;",
             "}",
@@ -104,6 +104,122 @@ def check_document_sync(executable, initialize, shutdown):
     assert fixed["diagnostics"] == [], fixed
     assert edited["diagnostics"] == opened["diagnostics"], edited
     assert closed["diagnostics"] == [], closed
+
+
+def check_binding_diagnostics(executable, initialize, shutdown):
+    """Check source ranges, recovery and replacement of binding diagnostics."""
+    uri = "file:///tmp/plangd-binding-diagnostics.ptx"
+    valid = [
+        ".version 8.0",
+        ".target sm_90",
+        ".address_size 64",
+        ".extern .func helper();",
+        ".entry first() {",
+        "  .reg .u32 %r;",
+        "  .reg .u32 %temp;",
+        "  /* 中文🚀 */ mov.u32 %r, 0;",
+        "  /* 中文🚀 */ bra done;",
+        "  { .reg .u32 %r; mov.u32 %r, 0; }",
+        "  call.uni helper;",
+        "done:",
+        "  ret;",
+        "}",
+        ".entry second() {",
+        "  ret;",
+        "}",
+    ]
+
+    def edited(replacements):
+        lines = valid.copy()
+        for line, text in replacements.items():
+            lines[line] = text
+        return lines
+
+    binding_errors = edited({
+        6: "  .reg .u32 %r;",
+        7: valid[7].replace("%r", "%unknown"),
+        8: valid[8].replace("done", "missing"),
+    })
+    invalid_target = edited({8: valid[8].replace("done", "%r")})
+    recovering_function = edited({
+        6: "  { .reg .u32 ; }",
+        7: valid[7].replace("0;", "%temp;"),
+        15: "  bra outside_missing;",
+    })
+    recovering_module = edited({3: ".extern .func ;"})
+
+    def token_range(lines, line, spelling):
+        prefix = lines[line][:lines[line].index(spelling)]
+        column = len(prefix.encode("utf-16-le")) // 2
+        return {"start": {"line": line, "character": column},
+                "end": {"line": line, "character": column + len(spelling)}}
+
+    def change(version, lines):
+        return {"method": "textDocument/didChange", "params": {
+            "textDocument": {"uri": uri, "version": version},
+            "contentChanges": [{"text": "\r\n".join(lines)}],
+        }}
+
+    init = [{
+        **initialize[0], "params": {
+            **initialize[0]["params"], "capabilities": {
+                "textDocument": {"publishDiagnostics": {"relatedInformation": True}},
+            },
+        },
+    }, *initialize[1:]]
+    process, responses = exchange(executable, [
+        *init,
+        {"method": "textDocument/didOpen", "params": {"textDocument": {
+            "uri": uri, "languageId": "ptx", "version": 1, "text": "\r\n".join(valid),
+        }}},
+        change(2, binding_errors),
+        change(3, invalid_target),
+        change(4, valid),
+        change(5, recovering_function),
+        {"id": 20, "method": "textDocument/definition", "params": {
+            "textDocument": {"uri": uri},
+            "position": token_range(recovering_function, 7, "%r")["start"],
+        }},
+        change(6, recovering_module),
+        change(7, valid),
+        {"method": "textDocument/didClose", "params": {"textDocument": {"uri": uri}}},
+        *shutdown,
+    ])
+    assert process.returncode == 0, process.stderr
+    published = [response["params"] for response in responses
+                 if response.get("method") == "textDocument/publishDiagnostics"]
+    assert all(snapshot["uri"] == uri for snapshot in published), published
+    assert [snapshot.get("version") for snapshot in published] == [1, 2, 3, 4, 5, 6, 7, None]
+    opened, errors, target, fixed, partial, module, restored, closed = (
+        snapshot["diagnostics"] for snapshot in published
+    )
+    assert opened == fixed == restored == closed == [], published
+    assert len(errors) == 3, errors
+
+    def diagnostic_at(diagnostics, lines, line, spelling, expected_message):
+        expected_range = token_range(lines, line, spelling)
+        match = next((item for item in diagnostics if item["range"] == expected_range), None)
+        assert match is not None and expected_message in match["message"], diagnostics
+        assert match["severity"] == 1 and match["source"] == "plangd", match
+        return match
+
+    duplicate = diagnostic_at(errors, binding_errors, 6, "%r", "Duplicate symbol")
+    assert duplicate["relatedInformation"] == [{
+        "location": {"uri": uri, "range": token_range(valid, 5, "%r")},
+        "message": "Previous declaration is here.",
+    }], duplicate
+    diagnostic_at(errors, binding_errors, 7, "%unknown", "Unresolved")
+    diagnostic_at(errors, binding_errors, 8, "missing", "Unresolved branch target")
+    assert len(target) == 1, target
+    diagnostic_at(target, invalid_target, 8, "%r", "must name a label")
+
+    assert len(partial) == 2, partial
+    assert any(item["range"]["start"]["line"] == 6 for item in partial), partial
+    diagnostic_at(partial, recovering_function, 15, "outside_missing", "Unresolved branch target")
+    assert all("%temp" not in item["message"] for item in partial), partial
+    location = next(response["result"] for response in responses if response.get("id") == 20)
+    assert location == {"uri": uri, "range": token_range(valid, 5, "%r")}, location
+    assert module and all(item["range"]["start"]["line"] == 3 for item in module), module
 
 
 def check_symbol_navigation(executable, initialize, shutdown):
@@ -871,6 +987,7 @@ if __name__ == "__main__":
     assert responses == [], responses
 
     check_document_sync(executable, initialize, shutdown)
+    check_binding_diagnostics(executable, initialize, shutdown)
     check_symbol_navigation(executable, initialize, shutdown)
     check_symbol_references(executable, initialize, shutdown)
     check_instruction_completion(executable, initialize, shutdown)

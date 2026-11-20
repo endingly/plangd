@@ -13,6 +13,7 @@ namespace plangd {
 struct DocumentClientOptions {
   lsp::MarkupKind hover_kind;
   bool versioned_edits = false;
+  bool diagnostic_related_information = false;
 };
 
 /// Registers the open-document handlers using the negotiated client options.

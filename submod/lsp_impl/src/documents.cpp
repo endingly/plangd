@@ -29,6 +29,7 @@ namespace plangd {
 namespace {
 
 namespace binding = ptx_frontend::binding;
+namespace cst = ptx_frontend::syntax_cst;
 
 /// Byte span of one line in the document text, excluding its terminator.
 struct SourceLine {
@@ -43,8 +44,6 @@ struct Document {
   std::vector<SourceLine> lines{};
   std::vector<InstructionOccurrence> instructions{};
   std::vector<CompletionTargetRegion> completion_targets{};
-  // Retain the CST until the first symbol request builds the symbol table.
-  std::optional<ptx_frontend::syntax_cst::CstFile> cst{};
   std::optional<ptx_frontend::binding::SymbolTable> symbols{};
 };
 
@@ -138,30 +137,6 @@ lsp::Range toLspRange(const Document& document, ptx_frontend::SourceRange range)
           .end = toLspPosition(document, range.end)};
 }
 
-/// Parses the editor snapshot and replaces its diagnostics, even when empty.
-void publishDiagnostics(lsp::ServerEndpoint& endpoint,
-                        const lsp::DocumentUri& uri, Document& document) {
-  document.lines = indexLines(document.text);
-  auto result = ptx_frontend::PtxCstParser(document.text).parseModule();
-  if (result) {
-    document.instructions = indexInstructions(*result);
-    document.completion_targets = indexCompletionTargets(*result);
-  }
-  document.cst = std::move(result.value);
-  lsp::PublishDiagnosticsParams params{
-      .uri = uri, .diagnostics = {}, .version = document.version};
-  params.diagnostics.reserve(result.diagnostics.size());
-  for (auto& diagnostic : result.diagnostics) {
-    params.diagnostics.push_back(lsp::Diagnostic{
-        .range = toLspRange(document, diagnostic.range),
-        .message = std::move(diagnostic.message),
-        .severity = lsp::DiagnosticSeverity::Error,
-        .source = "plangd",
-    });
-  }
-  endpoint.textDocumentPublishDiagnostics(params);
-}
-
 /// Orders frontend positions by line and byte column.
 auto coordinates(ptx_frontend::SourcePos point) {
   return std::pair{point.line, point.column};
@@ -173,22 +148,104 @@ bool contains(ptx_frontend::SourceRange range, ptx_frontend::SourcePos point) {
   return coordinates(range.start) <= cursor && cursor < coordinates(range.end);
 }
 
+/// Converts a frontend error to a diagnostic for the current editor snapshot.
+lsp::Diagnostic documentDiagnostic(const Document& document,
+                                   ptx_frontend::SourceRange range,
+                                   std::string message) {
+  return {
+      .range = toLspRange(document, range),
+      .message = std::move(message),
+      .severity = lsp::DiagnosticSeverity::Error,
+      .source = "plangd",
+  };
+}
+
+/// Checks a function body and its nested blocks for parser recovery markers.
+bool recoveredBody(const std::vector<cst::CstFunctionBodyItem>& body) {
+  return std::ranges::any_of(body, [](const auto& item) {
+    if (std::holds_alternative<cst::CstRecoveryNode>(item)) {
+      return true;
+    }
+    const auto* block = std::get_if<std::unique_ptr<cst::CstBlock>>(&item);
+    return block && *block && recoveredBody((*block)->body);
+  });
+}
+
+/// Adds binding errors where the parser retained a reliable declaration context.
+void appendBindingDiagnostics(lsp::PublishDiagnosticsParams& params,
+                              const Document& document, const cst::CstFile& file,
+                              std::vector<binding::BindDiagnostic>& diagnostics,
+                              bool syntax_errors, bool related_information) {
+  std::vector<ptx_frontend::SourceRange> recovered_functions;
+  if (syntax_errors) {
+    const auto* module = file.module();
+    for (const auto& item : module->items) {
+      if (std::holds_alternative<cst::CstRecoveryNode>(item)) {
+        // A missing module declaration can change lookup in any function.
+        return;
+      }
+      if (const auto* function = std::get_if<cst::CstFunction>(&item);
+          function && recoveredBody(function->body)) {
+        recovered_functions.push_back(file.sourceRange(function->token_range));
+      }
+    }
+  }
+
+  for (auto& error : diagnostics) {
+    if (std::ranges::any_of(recovered_functions, [&](auto range) {
+          return contains(range, error.range.start);
+        })) {
+      continue;
+    }
+    auto diagnostic = documentDiagnostic(document, error.range,
+                                         std::move(error.message));
+    if (related_information && error.previous_range) {
+      diagnostic.relatedInformation.emplace().push_back({
+          .location = {params.uri, toLspRange(document, *error.previous_range)},
+          .message = "Previous declaration is here.",
+      });
+    }
+    params.diagnostics.push_back(std::move(diagnostic));
+  }
+}
+
+/// Analyzes the editor snapshot and replaces its diagnostics, even when empty.
+void publishDiagnostics(lsp::ServerEndpoint& endpoint,
+                        const lsp::DocumentUri& uri, Document& document,
+                        bool related_information) {
+  document.lines = indexLines(document.text);
+  auto result = ptx_frontend::PtxCstParser(document.text).parseModule();
+  lsp::PublishDiagnosticsParams params{
+      .uri = uri, .diagnostics = {}, .version = document.version};
+  params.diagnostics.reserve(result.diagnostics.size());
+  for (auto& error : result.diagnostics) {
+    params.diagnostics.push_back(documentDiagnostic(document, error.range,
+                                                   std::move(error.message)));
+  }
+  if (result) {
+    document.instructions = indexInstructions(*result);
+    document.completion_targets = indexCompletionTargets(*result);
+    auto ast = ptx_frontend::lowerSyntaxModule(*result);
+    for (auto& error : ast.diagnostics) {
+      params.diagnostics.push_back(documentDiagnostic(document, error.range,
+                                                     std::move(error.message)));
+    }
+    if (ast) {
+      auto bound = binding::bindSymbols(*ast);
+      if (ast.diagnostics.empty() && !bound.diagnostics.empty()) {
+        appendBindingDiagnostics(params, document, *result, bound.diagnostics,
+                                 !result.diagnostics.empty(), related_information);
+      }
+      document.symbols = std::move(bound.table);
+    }
+  }
+  endpoint.textDocumentPublishDiagnostics(params);
+}
+
 /// Identifies the symbol kinds covered by document-local navigation.
 bool isNavigable(const binding::Symbol& symbol) {
   return symbol.kind == binding::SymbolKind::Label ||
          symbol.state_space == ptx_frontend::base::DeclarationStateSpace::Register;
-}
-
-/// Binds the snapshot lazily and shares the same table across symbol features.
-const ptx_frontend::binding::SymbolTable* documentSymbols(Document& document) {
-  if (document.cst) {
-    auto ast = ptx_frontend::lowerSyntaxModule(*document.cst);
-    if (ast) {
-      document.symbols = ptx_frontend::binding::bindSymbols(*ast).table;
-    }
-    document.cst.reset();
-  }
-  return document.symbols ? &*document.symbols : nullptr;
 }
 
 /// Borrows the bound reference covering the cursor, if one exists.
@@ -202,9 +259,9 @@ const binding::SymbolReference* referenceAt(const binding::SymbolTable& symbols,
 }
 
 /// Resolves a cursor on a register or branch-label reference in this snapshot.
-std::optional<ResolvedReference> findReference(Document& document,
+std::optional<ResolvedReference> findReference(const Document& document,
                                                ptx_frontend::SourcePos source) {
-  const auto* symbols = documentSymbols(document);
+  const auto& symbols = document.symbols;
   if (!symbols) {
     return std::nullopt;
   }
@@ -279,13 +336,13 @@ std::vector<ptx_frontend::SourceRange> symbolOccurrences(
 
 /// Finds bound references in the current snapshot, including declarations on request.
 lsp::TextDocumentReferencesResult findReferences(
-    Document& document, const lsp::DocumentUri& uri, lsp::Position position,
+    const Document& document, const lsp::DocumentUri& uri, lsp::Position position,
     bool include_declaration) {
   const auto source = toSourcePosition(document, position);
   if (!source) {
     return nullptr;
   }
-  const auto* symbols = documentSymbols(document);
+  const auto& symbols = document.symbols;
   if (!symbols) {
     return nullptr;
   }
@@ -310,13 +367,13 @@ struct RenameTarget {
 };
 
 /// Resolves a rename target, requiring the declaration for a register group.
-std::optional<RenameTarget> renameTargetAt(Document& document,
+std::optional<RenameTarget> renameTargetAt(const Document& document,
                                           lsp::Position position) {
   const auto source = toSourcePosition(document, position);
   if (!source) {
     return std::nullopt;
   }
-  const auto* symbols = documentSymbols(document);
+  const auto& symbols = document.symbols;
   if (!symbols) {
     return std::nullopt;
   }
@@ -334,7 +391,7 @@ std::optional<RenameTarget> renameTargetAt(Document& document,
 }
 
 /// Reports the selected spelling and its exact range for the editor input box.
-lsp::TextDocumentPrepareRenameResult prepareRename(Document& document,
+lsp::TextDocumentPrepareRenameResult prepareRename(const Document& document,
                                                    lsp::Position position) {
   const auto target = renameTargetAt(document, position);
   if (!target) {
@@ -347,7 +404,7 @@ lsp::TextDocumentPrepareRenameResult prepareRename(Document& document,
 }
 
 /// Computes a complete rename edit from the current buffer without mutating it.
-lsp::TextDocumentRenameResult renameSymbol(Document& document,
+lsp::TextDocumentRenameResult renameSymbol(const Document& document,
                                           const lsp::DocumentUri& uri,
                                           lsp::Position position,
                                           const std::string& new_name,
@@ -407,7 +464,7 @@ lsp::TextDocumentRenameResult renameSymbol(Document& document,
 }
 
 /// Returns the declaration location of the reference under the cursor.
-lsp::TextDocumentDefinitionResult findDefinition(Document& document,
+lsp::TextDocumentDefinitionResult findDefinition(const Document& document,
                                                  const lsp::DocumentUri& uri,
                                                  lsp::Position position) {
   const auto source = toSourcePosition(document, position);
@@ -483,7 +540,7 @@ lsp::Hover makeHover(const Document& document, ptx_frontend::SourceRange range,
 }
 
 /// Looks up mnemonics first, then bound references in the editor snapshot.
-lsp::TextDocumentHoverResult findHover(Document& document, lsp::Position position,
+lsp::TextDocumentHoverResult findHover(const Document& document, lsp::Position position,
                                       lsp::MarkupKind kind) {
   const auto source = toSourcePosition(document, position);
   if (!source) {
@@ -520,7 +577,7 @@ lsp::CompletionItem completionItem(
 }
 
 /// Completes instruction heads and symbolic operands in the current snapshot.
-lsp::TextDocumentCompletionResult completeInstruction(Document& document,
+lsp::TextDocumentCompletionResult completeInstruction(const Document& document,
                                                       lsp::Position position) {
   const auto source = toSourcePosition(document, position);
   if (!source) {
@@ -534,7 +591,7 @@ lsp::TextDocumentCompletionResult completeInstruction(Document& document,
 
   lsp::Array<lsp::CompletionItem> items;
   if (const auto* symbol = std::get_if<SymbolCompletion>(&*context)) {
-    const auto* table = documentSymbols(document);
+    const auto& table = document.symbols;
     if (!table) {
       return nullptr;
     }
@@ -592,7 +649,7 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
   using Documents = std::unordered_map<lsp::DocumentUri, Document>;
   auto documents = std::make_shared<Documents>();
   endpoint.onTextDocumentDidOpen(
-      [&endpoint, documents](lsp::DidOpenTextDocumentParams&& params) {
+      [&endpoint, documents, options](lsp::DidOpenTextDocumentParams&& params) {
         auto& item = params.textDocument;
         if (item.languageId != "ptx" && !item.uri.path().ends_with(".ptx")) {
           return;
@@ -600,12 +657,13 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
         auto [entry, inserted] = documents->try_emplace(
             std::move(item.uri), Document{std::move(item.text), item.version});
         if (inserted) {
-          publishDiagnostics(endpoint, entry->first, entry->second);
+          publishDiagnostics(endpoint, entry->first, entry->second,
+                             options->diagnostic_related_information);
         }
       });
 
   endpoint.onTextDocumentDidChange(
-      [&endpoint, documents](lsp::DidChangeTextDocumentParams&& params) {
+      [&endpoint, documents, options](lsp::DidChangeTextDocumentParams&& params) {
         const auto& item = params.textDocument;
         auto entry = documents->find(item.uri);
         if (entry == documents->end() || item.version <= entry->second.version ||
@@ -619,7 +677,8 @@ void registerDocumentHandlers(lsp::ServerEndpoint& endpoint,
           return;
         }
         entry->second = Document{std::move(change->text), item.version};
-        publishDiagnostics(endpoint, entry->first, entry->second);
+        publishDiagnostics(endpoint, entry->first, entry->second,
+                           options->diagnostic_related_information);
       });
 
   endpoint.onTextDocumentDidClose(

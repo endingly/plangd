@@ -40,6 +40,9 @@ void registerHandlers(lsp::ServerEndpoint& endpoint, std::string_view version,
         options->versioned_edits = workspace && workspace->workspaceEdit &&
                                   workspace->workspaceEdit->documentChanges.value_or(false);
         const auto& document = params.capabilities.textDocument;
+        options->diagnostic_related_information =
+            document && document->publishDiagnostics &&
+            document->publishDiagnostics->relatedInformation.value_or(false);
         lsp::OneOf<lsp::Bool, lsp::RenameOptions> rename = true;
         if (document && document->rename && document->rename->prepareSupport.value_or(false)) {
           rename = lsp::RenameOptions{.prepareProvider = true};
